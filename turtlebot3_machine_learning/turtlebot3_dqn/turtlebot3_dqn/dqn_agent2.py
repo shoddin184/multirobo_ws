@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #################################################################################
-# DQN Agent for Robot 2
-# Independent DQN agent with its own neural network and learning
+# DQN Agent for Robot 2 - DEBUG VERSION
+# デバッグログを追加してフリーズの原因を特定
 #################################################################################
 
 import collections
@@ -12,10 +12,13 @@ import os
 import random
 import sys
 import time
+import threading
 
 import numpy
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import Float32MultiArray, String, Int32
 from std_srvs.srv import Empty
 import tensorflow
@@ -120,24 +123,61 @@ class DQNAgent1(Node):
             self.dqn_reward_writer = tensorflow.summary.create_file_writer(dqn_reward_log_dir)
             self.dqn_reward_metric = DQNMetric()
 
+        # ReentrantCallbackGroup を追加
+        self.cb_group = ReentrantCallbackGroup()
+
         # Publishers and subscribers with robot namespace
         self.status_pub = self.create_publisher(String, f'/{self.robot_name}/status', 10)
         self.action_pub = self.create_publisher(Float32MultiArray, f'/{self.robot_name}/get_action', 10)
         self.result_pub = self.create_publisher(Float32MultiArray, f'/{self.robot_name}/result', 10)
 
-        # Subscribe to coordinator signals
-        self.start_episode_sub = self.create_subscription(Int32, '/start_episode', self.start_episode_callback, 10)
+        # Subscribe to coordinator signals with callback group
+        self.start_episode_sub = self.create_subscription(
+            Int32, '/start_episode', 
+            self.start_episode_callback, 
+            10,
+            callback_group=self.cb_group
+        )
 
-        # Service clients with robot namespace
-        self.rl_agent_interface_client = self.create_client(Dqn, f'/{self.robot_name}/rl_agent_interface')
-        self.get_state_client = self.create_client(Dqn, f'/{self.robot_name}/get_state')
+        # Service clients with robot namespace and callback group
+        self.rl_agent_interface_client = self.create_client(
+            Dqn, f'/{self.robot_name}/rl_agent_interface',
+            callback_group=self.cb_group
+        )
+        self.get_state_client = self.create_client(
+            Dqn, f'/{self.robot_name}/get_state',
+            callback_group=self.cb_group
+        )
 
         self.episode_start_requested = False
         self.current_episode = 0
 
-        self.get_logger().info(f'{self.robot_name} DQN Agent initialized')
-        self.get_logger().info(f'{self.robot_name} Starting process() method...')
+        # ★ DEBUG: コールバック受信カウンター ★
+        self.callback_count = 0
 
+        self.get_logger().info(f'{self.robot_name} DQN Agent initialized')
+        self.get_logger().info(f'{self.robot_name} Starting process() method in separate thread...')
+
+        # process()を別スレッドで実行
+        self.process_thread = threading.Thread(target=self.process_wrapper)
+        self.process_thread.daemon = True
+        self.process_thread.start()
+
+        # ★ DEBUG: 定期的に状態を出力するタイマー ★
+        self.debug_timer = self.create_timer(5.0, self.debug_status_callback)
+
+    def debug_status_callback(self):
+        """定期的に内部状態を出力（デバッグ用）"""
+        self.get_logger().info(
+            f'[DEBUG] {self.robot_name} status: '
+            f'episode_start_requested={self.episode_start_requested}, '
+            f'current_episode={self.current_episode}, '
+            f'callback_count={self.callback_count}, '
+            f'process_thread.is_alive={self.process_thread.is_alive()}'
+        )
+
+    def process_wrapper(self):
+        """Wrapper for process() to handle exceptions in thread"""
         try:
             self.process()
         except Exception as e:
@@ -147,9 +187,13 @@ class DQNAgent1(Node):
 
     def start_episode_callback(self, msg):
         """Callback for episode start signal from coordinator"""
+        self.callback_count += 1  # ★ DEBUG: カウンターをインクリメント ★
         self.current_episode = msg.data
         self.episode_start_requested = True
-        self.get_logger().info(f'{self.robot_name} - Received start signal for episode {self.current_episode}')
+        self.get_logger().info(
+            f'{self.robot_name} - ★ CALLBACK RECEIVED ★ episode {self.current_episode} '
+            f'(callback_count={self.callback_count})'
+        )
 
     def publish_status(self):
         """Publish current status to coordinator"""
@@ -166,22 +210,48 @@ class DQNAgent1(Node):
         self.get_logger().info(f'{self.robot_name} - process() started')
         self.get_logger().info(f'{self.robot_name} - Waiting for coordinator to start episodes...')
 
+        # 初回起動時に少し待機してexecutorのspinが開始されるのを待つ
+        time.sleep(1.0)
+        
+        last_processed_episode = 0  # 最後に処理したエピソード番号を記録
+
         # Wait for coordinator to start managing episodes
         while rclpy.ok():
-            # Wait for episode start signal from coordinator
-            self.get_logger().info(f'{self.robot_name} - Waiting for episode start signal...')
-            self.episode_start_requested = False
+            self.get_logger().info(
+                f'{self.robot_name} - [WAIT LOOP] Waiting for episode start signal... '
+                f'episode_start_requested={self.episode_start_requested}, '
+                f'current_episode={self.current_episode}, '
+                f'last_processed_episode={last_processed_episode}'
+            )
 
-            while not self.episode_start_requested and rclpy.ok():
-                rclpy.spin_once(self, timeout_sec=0.1)
+            # ★ DEBUG: 待機ループの詳細ログ ★
+            wait_count = 0
+            while (not self.episode_start_requested or 
+                   self.current_episode <= last_processed_episode) and rclpy.ok():
+                wait_count += 1
+                if wait_count % 50 == 0:  # 5秒ごとにログ出力
+                    self.get_logger().info(
+                        f'{self.robot_name} - [WAITING] count={wait_count}, '
+                        f'episode_start_requested={self.episode_start_requested}, '
+                        f'current_episode={self.current_episode}, '
+                        f'last_processed_episode={last_processed_episode}, '
+                        f'condition1={not self.episode_start_requested}, '
+                        f'condition2={self.current_episode <= last_processed_episode}'
+                    )
+                time.sleep(0.1)
 
             if not rclpy.ok():
                 break
 
             episode = self.current_episode
-            self.get_logger().info(f'{self.robot_name} - Starting episode {episode}')
+            self.get_logger().info(f'{self.robot_name} - ★ Starting episode {episode} ★')
+            
+            # フラグをリセットして処理済みエピソードを記録
+            self.episode_start_requested = False
+            last_processed_episode = episode
 
             # Get initial state from environment (already reset by coordinator)
+            self.get_logger().info(f'{self.robot_name} - Getting initial state...')
             state = self.get_current_state()
             self.get_logger().info(f'{self.robot_name} - Received state, shape: {state.shape}')
 
@@ -190,6 +260,7 @@ class DQNAgent1(Node):
             sum_max_q = 0.0
 
             # Run episode
+            self.get_logger().info(f'{self.robot_name} - Entering episode loop...')
             while True:
                 local_step += 1
 
@@ -197,6 +268,11 @@ class DQNAgent1(Node):
                 sum_max_q += float(numpy.max(q_values))
 
                 action = int(self.get_action(state))
+
+                # ★ DEBUG: step()呼び出し前のログ ★
+                if local_step % 100 == 0:
+                    self.get_logger().info(f'{self.robot_name} - step {local_step}, calling step({action})...')
+
                 next_state, reward, done = self.step(action)
                 score += reward
 
@@ -214,6 +290,8 @@ class DQNAgent1(Node):
                 self.publish_status()
 
                 if done:
+                    self.get_logger().info(f'{self.robot_name} - ★ Episode {episode} DONE ★')
+
                     avg_max_q = sum_max_q / local_step if local_step > 0 else 0.0
 
                     msg = Float32MultiArray()
@@ -236,13 +314,26 @@ class DQNAgent1(Node):
                     )
 
                     # Episode complete - coordinator will handle reset
-                    self.get_logger().info(f'{self.robot_name} - Episode complete, waiting for coordinator...')
+                    self.get_logger().info(
+                        f'{self.robot_name} - Episode complete. '
+                        f'Before break: episode_start_requested={self.episode_start_requested}, '
+                        f'current_episode={self.current_episode}, '
+                        f'last_processed_episode will be {episode}'
+                    )
                     break
 
                 time.sleep(0.01)
 
+            self.get_logger().info(
+                f'{self.robot_name} - Exited episode loop. '
+                f'Now waiting for next episode. '
+                f'episode_start_requested={self.episode_start_requested}, '
+                f'current_episode={self.current_episode}, '
+                f'last_processed_episode={last_processed_episode}'
+            )
+
             # Save model periodically
-            if self.train_mode and episode % 250 == 0:
+            if self.train_mode and episode % 1000 == 0:
                 param_keys = ['epsilon', 'step_counter']
                 param_values = [self.epsilon, self.step_counter]
                 param_dictionary = dict(zip(param_keys, param_values))
@@ -263,14 +354,16 @@ class DQNAgent1(Node):
 
     def get_current_state(self):
         """Get current state from environment (called after coordinator resets environment)"""
-        # Use the get_state service which doesn't take any action
         req = Dqn.Request()
 
         while not self.get_state_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info(f'{self.robot_name} - Waiting for get_state service...')
 
         future = self.get_state_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
+        
+        # rclpy.spin_until_future_complete()を使わない（デッドロック回避）
+        while not future.done() and rclpy.ok():
+            time.sleep(0.01)
 
         if future.result() is not None:
             state = future.result().state
@@ -278,7 +371,6 @@ class DQNAgent1(Node):
             return state
         else:
             self.get_logger().error(f'{self.robot_name} - Failed to get current state')
-            # Return a dummy state
             return numpy.zeros([1, self.state_size])
 
     def get_action(self, state):
@@ -305,7 +397,9 @@ class DQNAgent1(Node):
 
         future = self.rl_agent_interface_client.call_async(req)
 
-        rclpy.spin_until_future_complete(self, future)
+        # rclpy.spin_until_future_complete()を使わない（デッドロック回避）
+        while not future.done() and rclpy.ok():
+            time.sleep(0.01)
 
         if future.result() is not None:
             next_state = future.result().state
@@ -315,6 +409,10 @@ class DQNAgent1(Node):
         else:
             self.get_logger().error(
                 f'{self.robot_name} - Exception while calling service: {future.exception()}')
+            # エラー時のデフォルト値を返す
+            next_state = numpy.zeros([1, self.state_size])
+            reward = 0.0
+            done = True
 
         return next_state, reward, done
 
@@ -390,10 +488,18 @@ def main(args=None):
     rclpy.init(args=args)
 
     dqn_agent = DQNAgent1(stage_num, max_training_episodes)
-    rclpy.spin(dqn_agent)
+    
+    # MultiThreadedExecutorを使用
+    executor = MultiThreadedExecutor()
+    executor.add_node(dqn_agent)
 
-    dqn_agent.destroy_node()
-    rclpy.shutdown()
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        dqn_agent.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -1,443 +1,445 @@
 #!/usr/bin/env python3
-#################################################################################
-# Multi-Robot RL Environment
-# Manages environment for individual robot with namespace support
-#################################################################################
+"""Multi-Robot RL Environment - Corrected for Deadlocks and Reset Issues."""
 
 import math
 import os
+import sys
+import time
 
-from geometry_msgs.msg import Twist
-from geometry_msgs.msg import TwistStamped
-from nav_msgs.msg import Odometry
-import numpy
+import numpy as np
 import rclpy
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, qos_profile_sensor_data
+from geometry_msgs.msg import Twist, TwistStamped
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty
+from turtlebot3_msgs.srv import Dqn, Goal
 
-from turtlebot3_msgs.srv import Dqn
-from turtlebot3_msgs.srv import Goal
-
-
+# Constants
 ROS_DISTRO = os.environ.get('ROS_DISTRO')
+GAZEBO_NS_MAP = {'robot1': 'TB3_1', 'robot2': 'TB3_2', 'robot3': 'TB3_3'}
+
+GOAL_THRESHOLD = 0.20
+COLLISION_THRESHOLD = 0.15
+OBSTACLE_DETECT_RANGE = 0.5
+MAX_LIDAR_RANGE = 3.5
+LINEAR_VELOCITY = 0.2
+ANGULAR_VELOCITIES = [1.5, 0.75, 0.0, -0.75, -1.5]
 
 
 class MultiRobotRLEnvironment(Node):
+    """RL Environment node for a single robot in multi-robot setup."""
 
     def __init__(self, robot_name='robot1'):
         super().__init__(f'rl_environment_{robot_name}')
-
         self.robot_name = robot_name
+        self.gazebo_ns = GAZEBO_NS_MAP.get(robot_name, robot_name)
 
-        # Map robot names to Gazebo namespaces
-        # robot1 -> TB3_1, robot2 -> TB3_2, robot3 -> TB3_3
-        gazebo_namespace_map = {
-            'robot1': 'TB3_1',
-            'robot2': 'TB3_2',
-            'robot3': 'TB3_3'
-        }
-        self.gazebo_namespace = gazebo_namespace_map.get(robot_name, robot_name)
+        # [FIX] ReentrantCallbackGroupを作成
+        # これにより、コールバック実行中でも別のスレッドが割り込んで処理可能になる
+        self.cb_group = ReentrantCallbackGroup()
 
-        self.goal_pose_x = 0.0
-        self.goal_pose_y = 0.0
-        self.robot_pose_x = 0.0
-        self.robot_pose_y = 0.0
+        self._init_state_variables()
+        self._init_publishers_subscribers()
+        self._init_service_clients()
+        self._init_services()
 
-        self.action_size = 5
-        self.max_step = 800
+        self.get_logger().info(f'{robot_name} environment initialized (Multi-Threaded)')
+
+    def _init_state_variables(self):
+        """Initialize state tracking variables."""
+        self.goal_pose = (0.0, 0.0)
+        self.robot_pose = (0.0, 0.0, 0.0)
+        self.goal_distance = 1.0
+        self.goal_angle = 0.0
+        self.init_goal_distance = 0.5
+        self.prev_goal_distance = 0.5
+
+        self.scan_ranges = []
+        self.front_ranges = []
+        self.front_angles = []
+        self.min_obstacle_distance = 10.0
 
         self.done = False
         self.fail = False
         self.succeed = False
-
-        self.goal_angle = 0.0
-        self.goal_distance = 1.0
-        self.init_goal_distance = 0.5
-        self.scan_ranges = []
-        self.front_ranges = []
-        self.min_obstacle_distance = 10.0
-        self.is_front_min_actual_front = False
-
         self.local_step = 0
-        self.stop_cmd_vel_timer = None
-        self.angular_vel = [1.5, 0.75, 0.0, -0.75, -1.5]
+        self.max_step = 800
+        self.stop_timer = None
+        
+        # [NEW] リセット中フラグ - リセット中は衝突判定をスキップ
+        self.is_resetting = False
 
+    def _init_publishers_subscribers(self):
+        """Initialize ROS publishers and subscribers."""
         qos = QoSProfile(depth=10)
+        cmd_vel_type = Twist if ROS_DISTRO == 'humble' else TwistStamped
 
-        # Publishers and subscribers - use Gazebo namespace for actual robot topics
-        if ROS_DISTRO == 'humble':
-            self.cmd_vel_pub = self.create_publisher(Twist, f'/{self.gazebo_namespace}/cmd_vel', qos)
-        else:
-            self.cmd_vel_pub = self.create_publisher(TwistStamped, f'/{self.gazebo_namespace}/cmd_vel', qos)
+        self.cmd_vel_pub = self.create_publisher(
+            cmd_vel_type, f'/{self.gazebo_ns}/cmd_vel', qos)
+        
+        # Topic購読は非同期で軽いのでデフォルトのままでも良いが、
+        # 念のためReentrantに入れても害はない（今回は指定なし＝デフォルト）
+        self.create_subscription(
+            Odometry, f'/{self.gazebo_ns}/odom', self._odom_callback, qos)
+        self.create_subscription(
+            LaserScan, f'/{self.gazebo_ns}/scan', self._scan_callback,
+            qos_profile_sensor_data)
 
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            f'/{self.gazebo_namespace}/odom',
-            self.odom_sub_callback,
-            qos
-        )
-        self.scan_sub = self.create_subscription(
-            LaserScan,
-            f'/{self.gazebo_namespace}/scan',
-            self.scan_sub_callback,
-            qos_profile_sensor_data
-        )
+    def _init_service_clients(self):
+        """Initialize service clients."""
+        ns = self.robot_name
 
-        self.get_logger().info(
-            f'RL Environment for {robot_name} initialized (Gazebo namespace: {self.gazebo_namespace})'
-        )
-
-        # Service clients with robot namespace
-        self.clients_callback_group = MutuallyExclusiveCallbackGroup()
+        # [FIX] クライアントも cb_group (Reentrant) に所属させる
         self.task_succeed_client = self.create_client(
-            Goal,
-            f'/{robot_name}/task_succeed',
-            callback_group=self.clients_callback_group
-        )
+            Goal, f'/{ns}/task_succeed', callback_group=self.cb_group)
         self.task_failed_client = self.create_client(
-            Goal,
-            f'/{robot_name}/task_failed',
-            callback_group=self.clients_callback_group
-        )
-        self.initialize_environment_client = self.create_client(
-            Goal,
-            f'/{robot_name}/initialize_env',
-            callback_group=self.clients_callback_group
-        )
+            Goal, f'/{ns}/task_failed', callback_group=self.cb_group)
+        self.init_env_client = self.create_client(
+            Goal, f'/{ns}/initialize_env', callback_group=self.cb_group)
 
-        # Services with robot namespace
-        self.rl_agent_interface_service = self.create_service(
-            Dqn,
-            f'/{robot_name}/rl_agent_interface',
-            self.rl_agent_interface_callback
-        )
-        self.make_environment_service = self.create_service(
-            Empty,
-            f'/{robot_name}/make_environment',
-            self.make_environment_callback
-        )
-        self.reset_environment_service = self.create_service(
-            Dqn,
-            f'/{robot_name}/reset_environment',
-            self.reset_environment_callback
-        )
-        self.get_state_service = self.create_service(
-            Dqn,
-            f'/{robot_name}/get_state',
-            self.get_state_callback
-        )
+    def _init_services(self):
+        """Initialize ROS services."""
+        ns = self.robot_name
+        
+        # [FIX] ★ここが最重要修正★
+        # サービスサーバー自体を ReentrantCallbackGroup に所属させる。
+        # これにより、_agent_callback 実行中でも、クライアントからの返答(別スレッド)を受け入れ可能になる。
+        self.create_service(Dqn, f'/{ns}/rl_agent_interface', self._agent_callback, callback_group=self.cb_group)
+        self.create_service(Empty, f'/{ns}/make_environment', self._make_env_callback, callback_group=self.cb_group)
+        self.create_service(Dqn, f'/{ns}/reset_environment', self._reset_env_callback, callback_group=self.cb_group)
+        self.create_service(Dqn, f'/{ns}/get_state', self._get_state_callback, callback_group=self.cb_group)
 
-    def make_environment_callback(self, request, response):
-        self.get_logger().info(f'{self.robot_name} - Make environment called')
-        while not self.initialize_environment_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn(
-                f'{self.robot_name} - service for initialize the environment is not available, waiting ...'
-            )
-        future = self.initialize_environment_client.call_async(Goal.Request())
-        rclpy.spin_until_future_complete(self, future)
-        response_goal = future.result()
-        if not response_goal.success:
-            self.get_logger().error(f'{self.robot_name} - initialize environment request failed')
-        else:
-            self.goal_pose_x = response_goal.pose_x
-            self.goal_pose_y = response_goal.pose_y
-            self.get_logger().info(
-                f'{self.robot_name} - goal initialized at [{self.goal_pose_x:.2f}, {self.goal_pose_y:.2f}]'
-            )
+    # --- Callbacks ---
 
-        return response
+    def _odom_callback(self, msg):
+        """Update robot pose and calculate goal metrics."""
+        pos = msg.pose.pose.position
+        _, _, theta = self._euler_from_quaternion(msg.pose.pose.orientation)
+        self.robot_pose = (pos.x, pos.y, theta)
 
-    def reset_environment_callback(self, request, response):
-        state = self.calculate_state()
-        self.get_logger().info(
-            f'{self.robot_name} - Reset environment: state size = {len(state)}, '
-            f'front_ranges size = {len(self.front_ranges)}'
-        )
-        self.init_goal_distance = state[0]
-        self.prev_goal_distance = self.init_goal_distance
-        response.state = state
+        gx, gy = self.goal_pose
+        rx, ry, rt = self.robot_pose
 
-        return response
+        self.goal_distance = math.hypot(gx - rx, gy - ry)
+        angle = math.atan2(gy - ry, gx - rx) - rt
+        self.goal_angle = self._normalize_angle(angle)
 
-    def get_state_callback(self, request, response):
-        """Get current state without taking any action"""
-        state = self.calculate_state_without_termination_check()
-        response.state = state
-        response.reward = 0.0
-        response.done = False
-        return response
-
-    def calculate_state_without_termination_check(self):
-        """Calculate state without checking for episode termination"""
-        state = []
-        state.append(float(self.goal_distance))
-        state.append(float(self.goal_angle))
-
-        # If LiDAR data is not ready yet, fill with default values
-        if len(self.front_ranges) == 0:
-            # Fill with 180 scan points with max range
-            for _ in range(180):
-                state.append(3.5)
-        else:
-            for var in self.front_ranges:
-                state.append(float(var))
-
-        return state
-
-    def call_task_succeed(self):
-        while not self.task_succeed_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn(
-                f'{self.robot_name} - service for task succeed is not available, waiting ...'
-            )
-        future = self.task_succeed_client.call_async(Goal.Request())
-        rclpy.spin_until_future_complete(self, future)
-        if future.result() is not None:
-            response = future.result()
-            self.goal_pose_x = response.pose_x
-            self.goal_pose_y = response.pose_y
-            self.get_logger().info(f'{self.robot_name} - service for task succeed finished')
-        else:
-            self.get_logger().error(f'{self.robot_name} - task succeed service call failed')
-
-    def call_task_failed(self):
-        while not self.task_failed_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn(
-                f'{self.robot_name} - service for task failed is not available, waiting ...'
-            )
-        future = self.task_failed_client.call_async(Goal.Request())
-        rclpy.spin_until_future_complete(self, future)
-        if future.result() is not None:
-            response = future.result()
-            self.goal_pose_x = response.pose_x
-            self.goal_pose_y = response.pose_y
-            self.get_logger().info(f'{self.robot_name} - service for task failed finished')
-        else:
-            self.get_logger().error(f'{self.robot_name} - task failed service call failed')
-
-    def scan_sub_callback(self, scan):
+    def _scan_callback(self, scan):
+        """Process LiDAR scan data."""
         self.scan_ranges = []
         self.front_ranges = []
         self.front_angles = []
 
-        num_of_lidar_rays = len(scan.ranges)
-        angle_min = scan.angle_min
-        angle_increment = scan.angle_increment
+        for i, dist in enumerate(scan.ranges):
+            angle = scan.angle_min + i * scan.angle_increment
+            dist = self._sanitize_distance(dist)
+            self.scan_ranges.append(dist)
 
-        self.front_distance = scan.ranges[0]
-
-        for i in range(num_of_lidar_rays):
-            angle = angle_min + i * angle_increment
-            distance = scan.ranges[i]
-
-            if distance == float('Inf'):
-                distance = 3.5
-            elif numpy.isnan(distance):
-                distance = 0.0
-
-            self.scan_ranges.append(distance)
-
-            if (0 <= angle <= math.pi/2) or (3*math.pi/2 <= angle <= 2*math.pi):
-                self.front_ranges.append(distance)
+            if self._is_front_angle(angle):
+                self.front_ranges.append(dist)
                 self.front_angles.append(angle)
 
         self.min_obstacle_distance = min(self.scan_ranges) if self.scan_ranges else 10.0
-        self.front_min_obstacle_distance = min(self.front_ranges) if self.front_ranges else 10.0
 
-    def odom_sub_callback(self, msg):
-        self.robot_pose_x = msg.pose.pose.position.x
-        self.robot_pose_y = msg.pose.pose.position.y
-        _, _, self.robot_pose_theta = self.euler_from_quaternion(msg.pose.pose.orientation)
+    def _agent_callback(self, request, response):
+        """Handle RL agent action request."""
+        # 1. Action
+        self._publish_velocity(request.action)
+        self._reset_stop_timer()
 
-        goal_distance = math.sqrt(
-            (self.goal_pose_x - self.robot_pose_x) ** 2
-            + (self.goal_pose_y - self.robot_pose_y) ** 2)
-        path_theta = math.atan2(
-            self.goal_pose_y - self.robot_pose_y,
-            self.goal_pose_x - self.robot_pose_x)
+        # 2. State Calculation & Termination Check
+        # 内部で衝突判定 -> _call_service が呼ばれる。
+        # Reentrant設定のおかげで、ここでブロックしてもデッドロックしない。
+        response.state = self._calculate_state()
+        
+        # 3. Reward & Done
+        response.reward = self._calculate_reward()
+        response.done = self.done  # ここには正しいTrue/Falseが入る
 
-        goal_angle = path_theta - self.robot_pose_theta
-        if goal_angle > math.pi:
-            goal_angle -= 2 * math.pi
+        # 4. Reset Flags if done
+        if self.done:
+            self._reset_episode_flags()
 
-        elif goal_angle < -math.pi:
-            goal_angle += 2 * math.pi
+        # 5. Return Response
+        # デッドロックが解消されたので、必ずここまで到達して送信される
+        return response
 
-        self.goal_distance = goal_distance
-        self.goal_angle = goal_angle
+    def _make_env_callback(self, request, response):
+        """Initialize environment with goal position."""
+        self._wait_for_service(self.init_env_client, 'initialize_env')
+        
+        # [FIX] call_async + wait ではなく、同期 call() を使用
+        req = Goal.Request()
+        result = self.init_env_client.call(req)
 
-    def calculate_state(self):
-        state = []
-        state.append(float(self.goal_distance))
-        state.append(float(self.goal_angle))
+        if result and result.success:
+            self.goal_pose = (result.pose_x, result.pose_y)
+        return response
 
-        # If LiDAR data is not ready yet, fill with default values
-        if len(self.front_ranges) == 0:
-            # Fill with 180 scan points with max range
-            for _ in range(180):
-                state.append(3.5)
-        else:
-            for var in self.front_ranges:
-                state.append(float(var))
+    # [FIX] ★★★ 完全に書き直した _reset_env_callback ★★★
+    def _reset_env_callback(self, request, response):
+        """Reset environment and return initial state."""
+        self.get_logger().info(f'{self.robot_name}: Resetting environment...')
+        
+        # 1. リセット中フラグを立てる（衝突判定をスキップするため）
+        self.is_resetting = True
+        
+        # 2. エピソードフラグをリセット
+        self._reset_episode_flags()
+        
+        # 3. ステップカウンタをリセット
+        self.local_step = 0
+        
+        # 4. ロボットを停止
+        self._stop_robot()
+        
+        # 5. 新しいゴール位置を取得（環境初期化サービスを呼ぶ）
+        #    これにより Stage Node がロボットをテレポートする
+        try:
+            self._call_service(self.init_env_client)
+            self.get_logger().info(f'{self.robot_name}: New goal position: {self.goal_pose}')
+        except Exception as e:
+            self.get_logger().error(f'{self.robot_name}: Failed to initialize env: {e}')
+        
+        # 6. センサーデータが更新されるまで待機
+        #    ロボットがテレポートされた後、LiDARデータが更新されるのを待つ
+        time.sleep(0.5)
+        
+        # 7. 障害物距離を安全な値にリセット（古いcollision状態をクリア）
+        self.min_obstacle_distance = MAX_LIDAR_RANGE
+        
+        # 8. 状態を取得（衝突判定なしで _build_state_vector を使用）
+        state = self._build_state_vector()
+        
+        # 9. 距離を初期化
+        self.init_goal_distance = state[0]
+        self.prev_goal_distance = self.init_goal_distance
+        
+        # 10. リセット中フラグを解除
+        self.is_resetting = False
+        
+        response.state = state
+        self.get_logger().info(f'{self.robot_name}: Environment reset complete. '
+                               f'min_obstacle_distance={self.min_obstacle_distance:.2f}')
+        return response
 
+    def _get_state_callback(self, request, response):
+        """Get current state without action."""
+        response.state = self._build_state_vector()
+        response.reward = 0.0
+        response.done = False
+        return response
+
+    # --- Core Logic ---
+
+    # [FIX] _calculate_state にリセット中チェックを追加
+    def _calculate_state(self):
+        """Calculate state and check termination conditions."""
+        state = self._build_state_vector()
         self.local_step += 1
 
-        if self.goal_distance < 0.20:
-            self.get_logger().info(f'{self.robot_name} - Goal Reached')
-            self.succeed = True
-            self.done = True
-            if ROS_DISTRO == 'humble':
-                self.cmd_vel_pub.publish(Twist())
-            else:
-                self.cmd_vel_pub.publish(TwistStamped())
-            self.local_step = 0
-            self.call_task_succeed()
+        # リセット中は衝突判定をスキップ
+        if self.is_resetting:
+            return state
 
-        if self.min_obstacle_distance < 0.15:
-            self.get_logger().info(f'{self.robot_name} - Collision happened')
-            self.fail = True
-            self.done = True
-            if ROS_DISTRO == 'humble':
-                self.cmd_vel_pub.publish(Twist())
-            else:
-                self.cmd_vel_pub.publish(TwistStamped())
-            self.local_step = 0
-            self.call_task_failed()
-
-        if self.local_step == self.max_step:
-            self.get_logger().info(f'{self.robot_name} - Time out!')
-            self.fail = True
-            self.done = True
-            if ROS_DISTRO == 'humble':
-                self.cmd_vel_pub.publish(Twist())
-            else:
-                self.cmd_vel_pub.publish(TwistStamped())
-            self.local_step = 0
-            self.call_task_failed()
+        if self.goal_distance < GOAL_THRESHOLD:
+            self._handle_success()
+        elif self.min_obstacle_distance < COLLISION_THRESHOLD:
+            self._handle_collision()
+        elif self.local_step >= self.max_step:
+            self._handle_timeout()
 
         return state
 
-    def compute_directional_weights(self, relative_angles, max_weight=10.0):
-        power = 6
-        raw_weights = (numpy.cos(relative_angles))**power + 0.1
-        scaled_weights = raw_weights * (max_weight / numpy.max(raw_weights))
-        normalized_weights = scaled_weights / numpy.sum(scaled_weights)
-        return normalized_weights
+    def _build_state_vector(self):
+        """Build state vector from current observations."""
+        state = [float(self.goal_distance), float(self.goal_angle)]
 
-    def compute_weighted_obstacle_reward(self):
+        if not self.front_ranges:
+            state.extend([MAX_LIDAR_RANGE] * 180)
+        else:
+            state.extend(float(r) for r in self.front_ranges)
+
+        return state
+
+    def _calculate_reward(self):
+        """Calculate reward for current state."""
+        if self.succeed:
+            return 100.0
+        if self.fail:
+            return -50.0
+
+        yaw_reward = 1 - (2 * abs(self.goal_angle) / math.pi)
+        obstacle_reward = self._compute_obstacle_reward()
+        return yaw_reward + obstacle_reward
+
+    def _compute_obstacle_reward(self):
+        """Compute weighted obstacle avoidance reward."""
         if not self.front_ranges or not self.front_angles:
             return 0.0
 
-        front_ranges = numpy.array(self.front_ranges)
-        front_angles = numpy.array(self.front_angles)
+        ranges = np.array(self.front_ranges)
+        angles = np.array(self.front_angles)
 
-        valid_mask = front_ranges <= 0.5
-        if not numpy.any(valid_mask):
+        mask = ranges <= OBSTACLE_DETECT_RANGE
+        if not np.any(mask):
             return 0.0
 
-        front_ranges = front_ranges[valid_mask]
-        front_angles = front_angles[valid_mask]
+        ranges, angles = ranges[mask], angles[mask]
+        angles = np.unwrap(angles)
+        angles[angles > np.pi] -= 2 * np.pi
 
-        relative_angles = numpy.unwrap(front_angles)
-        relative_angles[relative_angles > numpy.pi] -= 2 * numpy.pi
+        weights = self._compute_direction_weights(angles)
+        safe_dist = np.clip(ranges - 0.25, 1e-2, MAX_LIDAR_RANGE)
+        decay = np.exp(-3.0 * safe_dist)
 
-        weights = self.compute_directional_weights(relative_angles, max_weight=10.0)
+        return -(1.0 + 4.0 * np.dot(weights, decay))
 
-        safe_dists = numpy.clip(front_ranges - 0.25, 1e-2, 3.5)
-        decay = numpy.exp(-3.0 * safe_dists)
+    def _compute_direction_weights(self, angles, max_weight=10.0):
+        """Compute directional weights for obstacle avoidance."""
+        raw = np.cos(angles) ** 6 + 0.1
+        scaled = raw * (max_weight / np.max(raw))
+        return scaled / np.sum(scaled)
 
-        weighted_decay = numpy.dot(weights, decay)
+    # --- Episode Handling ---
 
-        reward = - (1.0 + 4.0 * weighted_decay)
+    def _handle_success(self):
+        self.get_logger().info(f'{self.robot_name}: Goal reached')
+        self._end_episode(succeed=True)
+        self._call_service(self.task_succeed_client)
 
-        return reward
+    def _handle_collision(self):
+        self.get_logger().info(f'{self.robot_name}: Collision')
+        self._end_episode(fail=True)
+        self._call_service(self.task_failed_client)
 
-    def calculate_reward(self):
-        yaw_reward = 1 - (2 * abs(self.goal_angle) / math.pi)
-        obstacle_reward = self.compute_weighted_obstacle_reward()
+    def _handle_timeout(self):
+        self.get_logger().info(f'{self.robot_name}: Timeout')
+        self._end_episode(fail=True)
+        self._call_service(self.task_failed_client)
 
-        reward = yaw_reward + obstacle_reward
+    def _end_episode(self, succeed=False, fail=False):
+        """End current episode."""
+        # デバッグログ
+        self.get_logger().warn('def _end_episode started!') 
+        self.succeed = succeed
+        self.fail = fail
+        self.done = True
+        self.local_step = 0
+        self._stop_robot()
 
-        if self.succeed:
-            reward = 100.0
-        elif self.fail:
-            reward = -50.0
+    def _reset_episode_flags(self):
+        """Reset episode state flags."""
+        self.done = False
+        self.succeed = False
+        self.fail = False
 
-        return reward
+    # --- Utility Methods ---
 
-    def rl_agent_interface_callback(self, request, response):
-        action = request.action
+    def _publish_velocity(self, action):
+        """Publish velocity command."""
         if ROS_DISTRO == 'humble':
             msg = Twist()
-            msg.linear.x = 0.2
-            msg.angular.z = self.angular_vel[action]
+            msg.linear.x = LINEAR_VELOCITY
+            msg.angular.z = ANGULAR_VELOCITIES[action]
         else:
             msg = TwistStamped()
-            msg.twist.linear.x = 0.2
-            msg.twist.angular.z = self.angular_vel[action]
-
+            msg.twist.linear.x = LINEAR_VELOCITY
+            msg.twist.angular.z = ANGULAR_VELOCITIES[action]
         self.cmd_vel_pub.publish(msg)
-        if self.stop_cmd_vel_timer is None:
-            self.prev_goal_distance = self.init_goal_distance
-            self.stop_cmd_vel_timer = self.create_timer(0.8, self.timer_callback)
-        else:
-            self.destroy_timer(self.stop_cmd_vel_timer)
-            self.stop_cmd_vel_timer = self.create_timer(0.8, self.timer_callback)
 
-        response.state = self.calculate_state()
-        response.reward = self.calculate_reward()
-        response.done = self.done
+    def _stop_robot(self):
+        """Stop robot movement."""
+        msg = Twist() if ROS_DISTRO == 'humble' else TwistStamped()
+        self.cmd_vel_pub.publish(msg)
 
-        if self.done is True:
-            self.done = False
-            self.succeed = False
-            self.fail = False
+    def _reset_stop_timer(self):
+        """Reset velocity stop timer."""
+        if self.stop_timer:
+            self.destroy_timer(self.stop_timer)
+        self.stop_timer = self.create_timer(0.8, self._stop_timer_callback)
 
-        return response
+    def _stop_timer_callback(self):
+        self._stop_robot()
+        self.destroy_timer(self.stop_timer)
 
-    def timer_callback(self):
-        if ROS_DISTRO == 'humble':
-            self.cmd_vel_pub.publish(Twist())
-        else:
-            self.cmd_vel_pub.publish(TwistStamped())
-        self.destroy_timer(self.stop_cmd_vel_timer)
+    def _call_service(self, client):
+        """Call a Goal service synchronously."""
+        # サービスが見つかるまで待機
+        if not client.service_is_ready():
+            self._wait_for_service(client, client.srv_name)
 
-    def euler_from_quaternion(self, quat):
-        x = quat.x
-        y = quat.y
-        z = quat.z
-        w = quat.w
+        req = Goal.Request()
 
-        sinr_cosp = 2 * (w * x + y * z)
-        cosr_cosp = 1 - 2 * (x * x + y * y)
-        roll = numpy.arctan2(sinr_cosp, cosr_cosp)
+        try:
+            response = client.call(req)
+            if response:
+                self.goal_pose = (response.pose_x, response.pose_y)
+        except Exception as e:
+            self.get_logger().error(f'Service call failed: {e}')
 
-        sinp = 2 * (w * y - z * x)
-        pitch = numpy.arcsin(sinp)
+    def _wait_for_service(self, client, name):
+        """Wait for service to be available."""
+        while not client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn(f'Waiting for {name} service...')
 
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
-        yaw = numpy.arctan2(siny_cosp, cosy_cosp)
+    @staticmethod
+    def _sanitize_distance(dist):
+        """Sanitize LiDAR distance value."""
+        if dist == float('Inf'):
+            return MAX_LIDAR_RANGE
+        if np.isnan(dist):
+            return 0.0
+        return dist
+
+    @staticmethod
+    def _is_front_angle(angle):
+        return (0 <= angle <= math.pi / 2) or (3 * math.pi / 2 <= angle <= 2 * math.pi)
+
+    @staticmethod
+    def _normalize_angle(angle):
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+
+    @staticmethod
+    def _euler_from_quaternion(q):
+        sinr = 2 * (q.w * q.x + q.y * q.z)
+        cosr = 1 - 2 * (q.x * q.x + q.y * q.y)
+        roll = np.arctan2(sinr, cosr)
+
+        pitch = np.arcsin(2 * (q.w * q.y - q.z * q.x))
+
+        siny = 2 * (q.w * q.z + q.x * q.y)
+        cosy = 1 - 2 * (q.y * q.y + q.z * q.z)
+        yaw = np.arctan2(siny, cosy)
 
         return roll, pitch, yaw
 
 
 def main(args=None):
-    import sys
     rclpy.init(args=args)
     robot_name = sys.argv[1] if len(sys.argv) > 1 else 'robot1'
 
-    rl_environment = MultiRobotRLEnvironment(robot_name)
+    node = MultiRobotRLEnvironment(robot_name)
+
+    # [FIX] MultiThreadedExecutor を使用
+    # num_threadsはPCのスペックに合わせて調整（デフォルトはCPUコア数）
+    executor = MultiThreadedExecutor() 
+    executor.add_node(node)
+
     try:
-        while rclpy.ok():
-            rclpy.spin_once(rl_environment, timeout_sec=0.1)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        rl_environment.destroy_node()
+        node.destroy_node()
         rclpy.shutdown()
 
 

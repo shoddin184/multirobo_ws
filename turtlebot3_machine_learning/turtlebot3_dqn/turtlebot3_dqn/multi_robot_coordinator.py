@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-#################################################################################
-# Multi-Robot DQN Coordinator
-# Centralized coordinator that manages all robots' environments and episodes
-#################################################################################
+"""Multi-Robot DQN Coordinator - Manages all robots' environments and episodes."""
+
+import sys
+import time
+import threading
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, String, Int32
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+from std_msgs.msg import Int32
 from std_srvs.srv import Empty
-from turtlebot3_msgs.srv import Dqn
-import json
-import time
+from turtlebot3_msgs.srv import Dqn, Goal
 
 
 class MultiRobotCoordinator(Node):
+    """Centralized coordinator for multi-robot DQN training."""
 
     def __init__(self, num_robots=3, max_episodes=1000):
         super().__init__('multi_robot_coordinator')
@@ -21,168 +23,265 @@ class MultiRobotCoordinator(Node):
         self.num_robots = num_robots
         self.max_episodes = max_episodes
         self.current_episode = 0
-
         self.robot_names = [f'robot{i+1}' for i in range(num_robots)]
 
+        # ReentrantCallbackGroup for concurrent service handling
+        self.cb_group = ReentrantCallbackGroup()
+        
+        # Episode transition lock
+        self.is_transitioning = False
+        
+        # ★ FIX: エピソード遷移を別スレッドで処理するためのフラグ ★
+        self._episode_complete_flag = threading.Event()
+
+        self._init_robot_status()
+        self._init_publishers()
+        self._init_service_clients()
+        self._init_service_servers()
+
+        self.get_logger().info(
+            f'Coordinator initialized: {num_robots} robots, {max_episodes} episodes')
+
+    def _init_robot_status(self):
+        """Initialize robot status tracking."""
         self.robot_status = {
-            name: {
-                'done': False,
-                'succeeded': False,
-                'failed': False,
-                'ready': False
-            } for name in self.robot_names
+            name: {'done': False, 'succeeded': False, 'failed': False, 'ready': False}
+            for name in self.robot_names
         }
 
-        # Subscribe to status updates from each robot
-        self.status_subscribers = []
-        for robot_name in self.robot_names:
-            sub = self.create_subscription(
-                String,
-                f'/{robot_name}/status',
-                lambda msg, name=robot_name: self.status_callback(msg, name),
-                10
-            )
-            self.status_subscribers.append(sub)
+    def _init_publishers(self):
+        """Initialize episode control publishers."""
+        self.start_pub = self.create_publisher(Int32, '/start_episode', 10)
 
-        # Publisher for episode control signals
-        self.reset_episode_pub = self.create_publisher(Bool, '/reset_episode', 10)
-        self.start_episode_pub = self.create_publisher(Int32, '/start_episode', 10)
-
-        # Service clients for environment management
+    def _init_service_clients(self):
+        """Initialize service clients for environment management."""
         self.make_env_clients = {}
         self.reset_env_clients = {}
 
-        for robot_name in self.robot_names:
-            self.make_env_clients[robot_name] = self.create_client(
-                Empty, f'/{robot_name}/make_environment'
-            )
-            self.reset_env_clients[robot_name] = self.create_client(
-                Dqn, f'/{robot_name}/reset_environment'
-            )
+        for name in self.robot_names:
+            self.make_env_clients[name] = self.create_client(
+                Empty, f'/{name}/make_environment',
+                callback_group=self.cb_group)
+            self.reset_env_clients[name] = self.create_client(
+                Dqn, f'/{name}/reset_environment',
+                callback_group=self.cb_group)
 
-        self.get_logger().info(f'Multi-Robot Coordinator initialized for {num_robots} robots')
-        self.get_logger().info(f'Max episodes: {max_episodes}')
+    def _init_service_servers(self):
+        """Initialize service servers to receive episode end notifications."""
+        for name in self.robot_names:
+            # task_succeed service server
+            self.create_service(
+                Goal, f'/{name}/task_succeed',
+                lambda req, res, n=name: self._task_succeed_callback(req, res, n),
+                callback_group=self.cb_group)
+            
+            # task_failed service server
+            self.create_service(
+                Goal, f'/{name}/task_failed',
+                lambda req, res, n=name: self._task_failed_callback(req, res, n),
+                callback_group=self.cb_group)
+            
+            # initialize_env service server
+            self.create_service(
+                Goal, f'/{name}/initialize_env',
+                lambda req, res, n=name: self._initialize_env_callback(req, res, n),
+                callback_group=self.cb_group)
+
+    # --- Service Callbacks ---
+
+    def _task_succeed_callback(self, request, response, robot_name):
+        """Handle task success notification from robot."""
+        # Ignore notifications during episode transition
+        if self.is_transitioning:
+            self.get_logger().warn(
+                f'{robot_name}: Task succeeded (ignored - transitioning)')
+            response.success = True
+            response.pose_x = 0.0
+            response.pose_y = 0.0
+            return response
+        
+        self.get_logger().info(f'{robot_name}: Task succeeded (received)')
+        
+        status = self.robot_status[robot_name]
+        status['done'] = True
+        status['succeeded'] = True
+        
+        # Return new goal position (placeholder - implement goal generation logic)
+        response.success = True
+        response.pose_x = 0.0
+        response.pose_y = 0.0
+        
+        # ★ FIX: コールバック内で直接処理せず、フラグをセットするだけ ★
+        if self._all_done():
+            self.get_logger().info('All robots done - setting episode complete flag')
+            self._episode_complete_flag.set()
+        
+        return response
+
+    def _task_failed_callback(self, request, response, robot_name):
+        """Handle task failure notification from robot."""
+        # Ignore notifications during episode transition
+        if self.is_transitioning:
+            self.get_logger().warn(
+                f'{robot_name}: Task failed (ignored - transitioning)')
+            response.success = True
+            response.pose_x = 0.0
+            response.pose_y = 0.0
+            return response
+        
+        self.get_logger().info(f'{robot_name}: Task failed (received)')
+        
+        status = self.robot_status[robot_name]
+        status['done'] = True
+        status['failed'] = True
+        
+        # Return new goal position (placeholder - implement goal generation logic)
+        response.success = True
+        response.pose_x = 0.0
+        response.pose_y = 0.0
+        
+        # ★ FIX: コールバック内で直接処理せず、フラグをセットするだけ ★
+        if self._all_done():
+            self.get_logger().info('All robots done - setting episode complete flag')
+            self._episode_complete_flag.set()
+        
+        return response
+
+    def _initialize_env_callback(self, request, response, robot_name):
+        """Handle environment initialization request from robot."""
+        self.get_logger().info(f'{robot_name}: Initialize environment (received)')
+        
+        # Return initial goal position (placeholder - implement goal generation logic)
+        response.success = True
+        response.pose_x = 2.0  # Example goal
+        response.pose_y = 2.0  # Example goal
+        
+        return response
+
+    # --- Environment Management ---
 
     def initialize_all_environments(self):
-        """Initialize environments for all robots"""
-        self.get_logger().info('Initializing environments for all robots...')
-
-        for robot_name in self.robot_names:
-            self.get_logger().info(f'Waiting for {robot_name} make_environment service...')
-            if not self.make_env_clients[robot_name].wait_for_service(timeout_sec=10.0):
-                self.get_logger().error(f'Service {robot_name}/make_environment not available!')
+        """Initialize environments for all robots."""
+        for name in self.robot_names:
+            if not self.make_env_clients[name].wait_for_service(timeout_sec=10.0):
+                self.get_logger().error(f'{name}/make_environment not available')
                 return False
 
-            future = self.make_env_clients[robot_name].call_async(Empty.Request())
-            rclpy.spin_until_future_complete(self, future)
+            future = self.make_env_clients[name].call_async(Empty.Request())
+            
+            # ★ FIX: spin_until_future_completeの代わりにポーリング ★
+            while not future.done() and rclpy.ok():
+                time.sleep(0.01)
 
-            if future.result() is not None:
-                self.get_logger().info(f'{robot_name} environment initialized')
-            else:
-                self.get_logger().error(f'Failed to initialize {robot_name} environment')
+            if future.result() is None:
+                self.get_logger().error(f'Failed to init {name} environment')
                 return False
 
-        self.get_logger().info('All environments initialized successfully')
+        self.get_logger().info('All environments initialized')
         return True
 
     def reset_all_environments(self):
-        """Reset environments for all robots and return states"""
-        self.get_logger().info('Resetting environments for all robots...')
+        """Reset all robot environments and return states."""
         states = {}
 
-        for robot_name in self.robot_names:
-            if not self.reset_env_clients[robot_name].wait_for_service(timeout_sec=5.0):
-                self.get_logger().error(f'Service {robot_name}/reset_environment not available!')
+        for name in self.robot_names:
+            if not self.reset_env_clients[name].wait_for_service(timeout_sec=5.0):
+                self.get_logger().error(f'{name}/reset_environment service not available')
                 return None
 
-            future = self.reset_env_clients[robot_name].call_async(Dqn.Request())
-            rclpy.spin_until_future_complete(self, future)
+            future = self.reset_env_clients[name].call_async(Dqn.Request())
+            
+            # ★ FIX: spin_until_future_completeの代わりにポーリング ★
+            while not future.done() and rclpy.ok():
+                time.sleep(0.01)
 
-            if future.result() is not None:
-                states[robot_name] = future.result().state
-                self.get_logger().info(f'{robot_name} environment reset, state size: {len(states[robot_name])}')
-            else:
-                self.get_logger().error(f'Failed to reset {robot_name} environment')
+            if future.result() is None:
+                self.get_logger().error(f'Failed to reset {name} environment')
                 return None
+            states[name] = future.result().state
 
         return states
 
-    def status_callback(self, msg, robot_name):
-        """Receive status updates from individual robots"""
-        try:
-            status_data = json.loads(msg.data)
-            self.robot_status[robot_name]['done'] = status_data.get('done', False)
-            self.robot_status[robot_name]['succeeded'] = status_data.get('succeeded', False)
-            self.robot_status[robot_name]['failed'] = status_data.get('failed', False)
-            self.robot_status[robot_name]['ready'] = status_data.get('ready', False)
+    # --- Episode Management ---
 
-            # Check if all robots are done
-            if self.check_all_done():
-                self.handle_episode_complete()
+    def _all_done(self):
+        """Check if all robots completed their tasks."""
+        return all(s['done'] for s in self.robot_status.values())
 
-        except json.JSONDecodeError as e:
-            self.get_logger().error(f'Failed to parse status from {robot_name}: {e}')
-
-    def check_all_done(self):
-        """Check if all robots have completed their tasks"""
-        return all(status['done'] for status in self.robot_status.values())
-
-    def check_all_ready(self):
-        """Check if all robots are ready to start"""
-        return all(status['ready'] for status in self.robot_status.values())
-
-    def handle_episode_complete(self):
-        """Handle episode completion when all robots are done"""
-        num_succeeded = sum(1 for status in self.robot_status.values() if status['succeeded'])
-        num_failed = sum(1 for status in self.robot_status.values() if status['failed'])
+    def _handle_episode_complete(self):
+        """Handle episode completion and start next episode."""
+        self.is_transitioning = True
+        
+        self.get_logger().info(f'=== Episode {self.current_episode} complete handler started ===') 
+        succeeded = sum(1 for s in self.robot_status.values() if s['succeeded'])
+        failed = sum(1 for s in self.robot_status.values() if s['failed'])
 
         self.get_logger().info(
-            f'Episode {self.current_episode} Complete! '
-            f'Succeeded: {num_succeeded}/{self.num_robots}, '
-            f'Failed: {num_failed}/{self.num_robots}'
-        )
+            f'Episode {self.current_episode}: {succeeded}/{self.num_robots} succeeded, '
+            f'{failed}/{self.num_robots} failed')
 
-        # Reset all robot statuses
-        for robot_name in self.robot_status:
-            self.robot_status[robot_name] = {
-                'done': False,
-                'succeeded': False,
-                'failed': False,
-                'ready': False
-            }
-
-        # Check if training is complete
         if self.current_episode >= self.max_episodes:
-            self.get_logger().info(f'Training complete! Reached {self.max_episodes} episodes')
+            self.get_logger().info('Training complete')
+            self.is_transitioning = False
             return
 
-        # Reset environments for next episode
+        self.get_logger().info('Starting environment reset...')
         time.sleep(0.5)
         states = self.reset_all_environments()
 
-        if states is not None:
-            # Start next episode
-            self.current_episode += 1
-            self.get_logger().info(f'Starting episode {self.current_episode}...')
+        if states is None:
+            self.get_logger().error('reset_all_environments() returned None - Episode loop stopped!')
+            self.is_transitioning = False
+            return
 
-            start_msg = Int32()
-            start_msg.data = self.current_episode
-            self.start_episode_pub.publish(start_msg)
+        self.get_logger().info(f'Environment reset successful, got {len(states)} states')
+
+        # Reset status AFTER reset_all_environments completes
+        for name in self.robot_status:
+            self.robot_status[name] = {
+                'done': False, 'succeeded': False, 'failed': False, 'ready': False}
+
+        # Increment episode
+        self.current_episode += 1
+        self.get_logger().info(f'Episode incremented to {self.current_episode}')
+        
+        # Wait a bit for agents to be ready
+        time.sleep(0.2)
+        
+        # Publish start signal multiple times
+        self._publish_start_with_retry(self.current_episode)
+        
+        self.is_transitioning = False
+        self.get_logger().info(f'=== Episode {self.current_episode} transition complete ===')
+
+    def _publish_start(self, episode):
+        """Publish episode start signal."""
+        self.get_logger().info(
+        f'★ PUBLISHING ★ episode {episode} at {time.time()}'
+        )
+        msg = Int32()
+        msg.data = episode
+        self.start_pub.publish(msg)
+
+    def _publish_start_with_retry(self, episode, retries=3, interval=0.1):
+        """Publish episode start signal with retries to ensure delivery."""
+        for i in range(retries):
+            self._publish_start(episode)
+            if i < retries - 1:
+                time.sleep(interval)
+        self.get_logger().info(f'Published start signal {retries} times for episode {episode}')
+
+    # --- Training ---
 
     def run_training(self):
-        """Main training loop controlled by coordinator"""
-        self.get_logger().info('Starting training coordination...')
-
-        # Initialize all environments
+        """Run the training loop."""
         if not self.initialize_all_environments():
-            self.get_logger().error('Failed to initialize environments')
             return
 
         time.sleep(2.0)
 
         # Start first episode
         self.current_episode = 1
-        self.get_logger().info('Resetting environments for episode 1...')
         states = self.reset_all_environments()
 
         if states is None:
@@ -190,44 +289,57 @@ class MultiRobotCoordinator(Node):
             return
 
         time.sleep(1.0)
+        
+        self._publish_start_with_retry(self.current_episode)
+        self.get_logger().info('Training started')
 
-        # Send start signal for first episode
-        self.get_logger().info(f'Starting episode {self.current_episode}')
-        start_msg = Int32()
-        start_msg.data = self.current_episode
-        self.start_episode_pub.publish(start_msg)
-
-        # Now spin and handle episode completions
-        self.get_logger().info('Training loop running, waiting for episode completions...')
-
-    def get_episode_stats(self):
-        """Get current episode statistics"""
-        return {
-            'current_episode': self.current_episode,
-            'total_robots': self.num_robots,
-            'completed': sum(1 for status in self.robot_status.values() if status['done']),
-            'succeeded': sum(1 for status in self.robot_status.values() if status['succeeded']),
-            'failed': sum(1 for status in self.robot_status.values() if status['failed'])
-        }
+    def episode_monitor_loop(self):
+        self.get_logger().info('Episode monitor loop started')
+        
+        while rclpy.ok():
+            # エピソード完了フラグを待つ
+            if self._episode_complete_flag.wait(timeout=0.5):
+                self._episode_complete_flag.clear()
+                self.get_logger().info('Episode complete flag received - handling transition')
+                self._handle_episode_complete()
 
 
 def main(args=None):
     rclpy.init(args=args)
 
-    import sys
     num_robots = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     max_episodes = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
 
-    coordinator = MultiRobotCoordinator(num_robots=num_robots, max_episodes=max_episodes)
-
-    # Run the training coordination
+    coordinator = MultiRobotCoordinator(num_robots, max_episodes)
+    
+    # ★ FIX: Executorを先にセットアップして別スレッドでspinを開始 ★
+    executor = MultiThreadedExecutor()  
+    executor.add_node(coordinator)
+    
+    # executorを別スレッドでspin
+    executor_thread = threading.Thread(target=executor.spin)
+    executor_thread.daemon = True
+    executor_thread.start()
+    
+    # executorが開始されるのを少し待つ
+    time.sleep(0.5)
+    
+    # エピソード監視ループを別スレッドで開始
+    monitor_thread = threading.Thread(target=coordinator.episode_monitor_loop)
+    monitor_thread.daemon = True
+    monitor_thread.start()
+    
+    # トレーニング開始（これはブロッキングしない）
     coordinator.run_training()
 
+    # メインスレッドはexecutorスレッドの終了を待つ
     try:
-        rclpy.spin(coordinator)
+        while rclpy.ok():
+            time.sleep(1.0)
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown() 
         coordinator.destroy_node()
         rclpy.shutdown()
 
