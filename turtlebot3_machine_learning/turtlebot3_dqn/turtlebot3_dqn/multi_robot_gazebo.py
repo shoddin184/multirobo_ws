@@ -197,12 +197,21 @@ class MultiRobotGazeboInterface(Node):
         """Synchronous robot position reset (runs in separate thread)"""
         with self._reset_lock:
             try:
-                # Get initial position for this robot
-                initial_positions = {
-                    'robot1': {'x': 2.0, 'y': 1.0},
-                    'robot2': {'x': -2.0, 'y': 1.0},
-                    'robot3': {'x': 0.0, 'y': -2.0}
-                }
+                # Get initial position for this robot based on stage
+                if self.stage == 4:
+                    # Stage 4: Use positions with more spacing
+                    initial_positions = {
+                        'robot1': {'x': 2.0, 'y': 1.0},
+                        'robot2': {'x': -2.0, 'y': 1.0},
+                        'robot3': {'x': 0.0, 'y': -2.0}
+                    }
+                else:
+                    # Stage 1, 2, 3: Use default positions
+                    initial_positions = {
+                        'robot1': {'x': 2.0, 'y': 0.0},
+                        'robot2': {'x': -0.5, 'y': 2.0},
+                        'robot3': {'x': -0.5, 'y': -2.0}
+                    }
                 pos = initial_positions.get(self.robot_name, {'x': 0.0, 'y': 0.0})
                 self.get_logger().info(f'[{self.robot_name}] Target position: ({pos["x"]}, {pos["y"]})')
 
