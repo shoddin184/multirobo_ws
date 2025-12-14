@@ -184,19 +184,19 @@ class MultiRobotRLEnvironment(Node):
     def _reset_env_callback(self, request, response):
         """Reset environment and return initial state."""
         self.get_logger().info(f'{self.robot_name}: Resetting environment...')
-        
+
         # 1. リセット中フラグを立てる（衝突判定をスキップするため）
         self.is_resetting = True
-        
+
         # 2. エピソードフラグをリセット
         self._reset_episode_flags()
-        
+
         # 3. ステップカウンタをリセット
         self.local_step = 0
-        
+
         # 4. ロボットを停止
         self._stop_robot()
-        
+
         # 5. 新しいゴール位置を取得（環境初期化サービスを呼ぶ）
         #    これにより Stage Node がロボットをテレポートする
         try:
@@ -204,24 +204,27 @@ class MultiRobotRLEnvironment(Node):
             self.get_logger().info(f'{self.robot_name}: New goal position: {self.goal_pose}')
         except Exception as e:
             self.get_logger().error(f'{self.robot_name}: Failed to initialize env: {e}')
-        
+
         # 6. センサーデータが更新されるまで待機
         #    ロボットがテレポートされた後、LiDARデータが更新されるのを待つ
         time.sleep(0.5)
-        
+
         # 7. 障害物距離を安全な値にリセット（古いcollision状態をクリア）
         self.min_obstacle_distance = MAX_LIDAR_RANGE
-        
+
         # 8. 状態を取得（衝突判定なしで _build_state_vector を使用）
         state = self._build_state_vector()
-        
+
         # 9. 距離を初期化
         self.init_goal_distance = state[0]
         self.prev_goal_distance = self.init_goal_distance
-        
-        # 10. リセット中フラグを解除
+
+        # 10. さらに少し待機してGazeboの状態が完全に安定するのを待つ
+        time.sleep(0.3)
+
+        # 11. リセット中フラグを解除
         self.is_resetting = False
-        
+
         response.state = state
         self.get_logger().info(f'{self.robot_name}: Environment reset complete. '
                                f'min_obstacle_distance={self.min_obstacle_distance:.2f}')

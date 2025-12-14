@@ -187,7 +187,7 @@ class DQNAgent1(Node):
 
     def start_episode_callback(self, msg):
         """Callback for episode start signal from coordinator"""
-        self.callback_count += 1  # ★ DEBUG: カウンターをインクリメント ★
+        self.callback_count += 1  
         self.current_episode = msg.data
         self.episode_start_requested = True
         self.get_logger().info(
@@ -226,8 +226,7 @@ class DQNAgent1(Node):
 
             # ★ DEBUG: 待機ループの詳細ログ ★
             wait_count = 0
-            while (not self.episode_start_requested or 
-                   self.current_episode <= last_processed_episode) and rclpy.ok():
+            while self.current_episode <= last_processed_episode and rclpy.ok():
                 wait_count += 1
                 if wait_count % 50 == 0:  # 5秒ごとにログ出力
                     self.get_logger().info(
@@ -243,12 +242,14 @@ class DQNAgent1(Node):
             if not rclpy.ok():
                 break
 
+            # ★ FIX: エピソード番号を待機ループを抜ける直前に確定 ★
             episode = self.current_episode
-            self.get_logger().info(f'{self.robot_name} - ★ Starting episode {episode} ★')
-            
-            # フラグをリセットして処理済みエピソードを記録
-            self.episode_start_requested = False
             last_processed_episode = episode
+
+            self.get_logger().info(f'{self.robot_name} - ★ Starting episode {episode} ★')
+
+            # フラグをリセット
+            self.episode_start_requested = False
 
             # Get initial state from environment (already reset by coordinator)
             self.get_logger().info(f'{self.robot_name} - Getting initial state...')

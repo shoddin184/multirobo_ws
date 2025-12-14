@@ -80,12 +80,6 @@ class MultiRobotCoordinator(Node):
                 Goal, f'/{name}/task_failed',
                 lambda req, res, n=name: self._task_failed_callback(req, res, n),
                 callback_group=self.cb_group)
-            
-            # initialize_env service server
-            self.create_service(
-                Goal, f'/{name}/initialize_env',
-                lambda req, res, n=name: self._initialize_env_callback(req, res, n),
-                callback_group=self.cb_group)
 
     # --- Service Callbacks ---
 
@@ -144,17 +138,6 @@ class MultiRobotCoordinator(Node):
         if self._all_done():
             self.get_logger().info('All robots done - setting episode complete flag')
             self._episode_complete_flag.set()
-        
-        return response
-
-    def _initialize_env_callback(self, request, response, robot_name):
-        """Handle environment initialization request from robot."""
-        self.get_logger().info(f'{robot_name}: Initialize environment (received)')
-        
-        # Return initial goal position (placeholder - implement goal generation logic)
-        response.success = True
-        response.pose_x = 2.0  # Example goal
-        response.pose_y = 2.0  # Example goal
         
         return response
 
@@ -250,7 +233,10 @@ class MultiRobotCoordinator(Node):
         
         # Publish start signal multiple times
         self._publish_start_with_retry(self.current_episode)
-        
+
+        # Wait a bit longer to ensure all old notifications are processed
+        time.sleep(0.5)
+
         self.is_transitioning = False
         self.get_logger().info(f'=== Episode {self.current_episode} transition complete ===')
 
