@@ -94,10 +94,11 @@ class MultiRobotRLEnvironment(Node):
         ns = self.robot_name
 
         # [FIX] クライアントも cb_group (Reentrant) に所属させる
+        # ★ FIX: coordinator 用のサービスを呼び出すように変更 ★
         self.task_succeed_client = self.create_client(
-            Goal, f'/{ns}/task_succeed', callback_group=self.cb_group)
+            Goal, f'/{ns}/coordinator/task_succeed', callback_group=self.cb_group)
         self.task_failed_client = self.create_client(
-            Goal, f'/{ns}/task_failed', callback_group=self.cb_group)
+            Goal, f'/{ns}/coordinator/task_failed', callback_group=self.cb_group)
         self.init_env_client = self.create_client(
             Goal, f'/{ns}/initialize_env', callback_group=self.cb_group)
 

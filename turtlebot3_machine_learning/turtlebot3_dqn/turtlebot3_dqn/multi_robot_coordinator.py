@@ -27,12 +27,15 @@ class MultiRobotCoordinator(Node):
 
         # ReentrantCallbackGroup for concurrent service handling
         self.cb_group = ReentrantCallbackGroup()
-        
+
         # Episode transition lock
         self.is_transitioning = False
-        
+
         # ★ FIX: エピソード遷移を別スレッドで処理するためのフラグ ★
         self._episode_complete_flag = threading.Event()
+
+        # ★ NEW: 遷移中に届いた通知を保存するキュー ★
+        self._pending_notifications = {name: None for name in self.robot_names}
 
         self._init_robot_status()
         self._init_publishers()
@@ -69,15 +72,16 @@ class MultiRobotCoordinator(Node):
     def _init_service_servers(self):
         """Initialize service servers to receive episode end notifications."""
         for name in self.robot_names:
-            # task_succeed service server
+            # ★ FIX: サービス名を変更して Gazebo ノードと競合しないようにする ★
+            # task_succeed service server (coordinator用)
             self.create_service(
-                Goal, f'/{name}/task_succeed',
+                Goal, f'/{name}/coordinator/task_succeed',
                 lambda req, res, n=name: self._task_succeed_callback(req, res, n),
                 callback_group=self.cb_group)
-            
-            # task_failed service server
+
+            # task_failed service server (coordinator用)
             self.create_service(
-                Goal, f'/{name}/task_failed',
+                Goal, f'/{name}/coordinator/task_failed',
                 lambda req, res, n=name: self._task_failed_callback(req, res, n),
                 callback_group=self.cb_group)
 
@@ -85,60 +89,62 @@ class MultiRobotCoordinator(Node):
 
     def _task_succeed_callback(self, request, response, robot_name):
         """Handle task success notification from robot."""
-        # Ignore notifications during episode transition
+        # ★ FIX: 遷移中の通知は無視せず、キューに保存 ★
         if self.is_transitioning:
             self.get_logger().warn(
-                f'{robot_name}: Task succeeded (ignored - transitioning)')
+                f'{robot_name}: Task succeeded (saved to queue - transitioning)')
+            self._pending_notifications[robot_name] = 'succeeded'
             response.success = True
             response.pose_x = 0.0
             response.pose_y = 0.0
             return response
-        
+
         self.get_logger().info(f'{robot_name}: Task succeeded (received)')
-        
+
         status = self.robot_status[robot_name]
         status['done'] = True
         status['succeeded'] = True
-        
+
         # Return new goal position (placeholder - implement goal generation logic)
         response.success = True
         response.pose_x = 0.0
         response.pose_y = 0.0
-        
+
         # ★ FIX: コールバック内で直接処理せず、フラグをセットするだけ ★
         if self._all_done():
             self.get_logger().info('All robots done - setting episode complete flag')
             self._episode_complete_flag.set()
-        
+
         return response
 
     def _task_failed_callback(self, request, response, robot_name):
         """Handle task failure notification from robot."""
-        # Ignore notifications during episode transition
+        # ★ FIX: 遷移中の通知は無視せず、キューに保存 ★
         if self.is_transitioning:
             self.get_logger().warn(
-                f'{robot_name}: Task failed (ignored - transitioning)')
+                f'{robot_name}: Task failed (saved to queue - transitioning)')
+            self._pending_notifications[robot_name] = 'failed'
             response.success = True
             response.pose_x = 0.0
             response.pose_y = 0.0
             return response
-        
+
         self.get_logger().info(f'{robot_name}: Task failed (received)')
-        
+
         status = self.robot_status[robot_name]
         status['done'] = True
         status['failed'] = True
-        
+
         # Return new goal position (placeholder - implement goal generation logic)
         response.success = True
         response.pose_x = 0.0
         response.pose_y = 0.0
-        
+
         # ★ FIX: コールバック内で直接処理せず、フラグをセットするだけ ★
         if self._all_done():
             self.get_logger().info('All robots done - setting episode complete flag')
             self._episode_complete_flag.set()
-        
+
         return response
 
     # --- Environment Management ---
@@ -187,6 +193,29 @@ class MultiRobotCoordinator(Node):
 
     # --- Episode Management ---
 
+    def _process_pending_notifications(self):
+        """遷移中に届いた通知をキューから取り出して処理する"""
+        processed_count = 0
+        for robot_name, notification in self._pending_notifications.items():
+            if notification is not None:
+                self.get_logger().info(
+                    f'Processing queued notification: {robot_name} -> {notification}')
+
+                status = self.robot_status[robot_name]
+                status['done'] = True
+
+                if notification == 'succeeded':
+                    status['succeeded'] = True
+                elif notification == 'failed':
+                    status['failed'] = True
+
+                # キューをクリア
+                self._pending_notifications[robot_name] = None
+                processed_count += 1
+
+        if processed_count > 0:
+            self.get_logger().info(f'Processed {processed_count} queued notifications')
+
     def _all_done(self):
         """Check if all robots completed their tasks."""
         return all(s['done'] for s in self.robot_status.values())
@@ -194,8 +223,8 @@ class MultiRobotCoordinator(Node):
     def _handle_episode_complete(self):
         """Handle episode completion and start next episode."""
         self.is_transitioning = True
-        
-        self.get_logger().info(f'=== Episode {self.current_episode} complete handler started ===') 
+
+        self.get_logger().info(f'=== Episode {self.current_episode} complete handler started ===')
         succeeded = sum(1 for s in self.robot_status.values() if s['succeeded'])
         failed = sum(1 for s in self.robot_status.values() if s['failed'])
 
@@ -207,6 +236,13 @@ class MultiRobotCoordinator(Node):
             self.get_logger().info('Training complete')
             self.is_transitioning = False
             return
+
+        # ★ FIX: 通知キューを先にクリア（古いエピソードの通知を破棄）★
+        for name in self._pending_notifications:
+            if self._pending_notifications[name] is not None:
+                self.get_logger().warn(
+                    f'Discarding stale notification from {name}: {self._pending_notifications[name]}')
+            self._pending_notifications[name] = None
 
         self.get_logger().info('Starting environment reset...')
         time.sleep(0.5)
@@ -224,20 +260,28 @@ class MultiRobotCoordinator(Node):
             self.robot_status[name] = {
                 'done': False, 'succeeded': False, 'failed': False, 'ready': False}
 
+        # ★ FIX: リセット後も通知キューをクリア（リセット中に来た古い通知を破棄）★
+        for name in self._pending_notifications:
+            if self._pending_notifications[name] is not None:
+                self.get_logger().warn(
+                    f'Discarding notification received during reset from {name}: {self._pending_notifications[name]}')
+            self._pending_notifications[name] = None
+
         # Increment episode
         self.current_episode += 1
         self.get_logger().info(f'Episode incremented to {self.current_episode}')
-        
+
+        # ★ FIX: is_transitioning を False にしてからスタート信号を送る ★
+        # これにより、エージェントからの通知が正しく処理される
+        self.is_transitioning = False
+        self.get_logger().info('Transition flag cleared')
+
         # Wait a bit for agents to be ready
-        time.sleep(0.2)
-        
+        time.sleep(0.3)
+
         # Publish start signal multiple times
         self._publish_start_with_retry(self.current_episode)
 
-        # Wait a bit longer to ensure all old notifications are processed
-        time.sleep(0.5)
-
-        self.is_transitioning = False
         self.get_logger().info(f'=== Episode {self.current_episode} transition complete ===')
 
     def _publish_start(self, episode):
@@ -249,12 +293,11 @@ class MultiRobotCoordinator(Node):
         msg.data = episode
         self.start_pub.publish(msg)
 
-    def _publish_start_with_retry(self, episode, retries=3, interval=0.1):
+    def _publish_start_with_retry(self, episode, retries=5, interval=0.2):
         """Publish episode start signal with retries to ensure delivery."""
         for i in range(retries):
             self._publish_start(episode)
-            if i < retries - 1:
-                time.sleep(interval)
+            time.sleep(interval)
         self.get_logger().info(f'Published start signal {retries} times for episode {episode}')
 
     # --- Training ---
