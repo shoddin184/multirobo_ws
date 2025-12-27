@@ -45,6 +45,7 @@ setup(
             'multi_robot_gazebo = turtlebot3_dqn.multi_robot_gazebo:main',
             'multi_robot_environment = turtlebot3_dqn.multi_robot_environment:main',
             'result_csv_logger = turtlebot3_dqn.result_csv_logger:main',
+            'multi_robot_dqn_test = turtlebot3_dqn.multi_robot_dqn_test:main',
         ],
     },
 )
