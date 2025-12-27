@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-#################################################################################
-# Multi-Robot Gazebo Interface
-# Manages goal spawning and deletion for multiple robots
-#################################################################################
-
 import os
 import random
 import subprocess
@@ -16,17 +11,34 @@ import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from std_srvs.srv import Empty
-
 from turtlebot3_msgs.srv import Goal
 
-
 ROS_DISTRO = os.environ.get('ROS_DISTRO')
+
 if ROS_DISTRO == 'humble':
-    from gazebo_msgs.srv import DeleteEntity
-    from gazebo_msgs.srv import SpawnEntity
-    from gazebo_msgs.srv import SetEntityState
+    from gazebo_msgs.srv import DeleteEntity, SpawnEntity, SetEntityState
     from gazebo_msgs.msg import EntityState
     from geometry_msgs.msg import Pose
+
+GAZEBO_ROBOT_MAP = {'robot1': 'burger_1', 'robot2': 'burger_2', 'robot3': 'burger_3'}
+
+INITIAL_POSITIONS = {
+    'default': {
+        'robot1': {'x': 2.0, 'y': 0.0},
+        'robot2': {'x': -0.5, 'y': 2.0},
+        'robot3': {'x': -0.5, 'y': -2.0},
+    },
+    'stage4': {
+        'robot1': {'x': 2.0, 'y': 1.0},
+        'robot2': {'x': -2.0, 'y': 1.0},
+        'robot3': {'x': 0.0, 'y': -2.0},
+    },
+}
+
+STAGE4_GOAL_POSITIONS = [
+    [1.0, 0.0], [2.0, -1.5], [0.0, -2.0], [2.0, 1.5], [0.5, 2.0], [-1.5, 2.1],
+    [-2.0, 0.5], [-2.0, -0.5], [-1.5, -2.0], [-0.5, -1.0], [2.0, -0.5], [-1.0, -1.0],
+]
 
 
 class MultiRobotGazeboInterface(Node):
@@ -35,196 +47,169 @@ class MultiRobotGazeboInterface(Node):
         super().__init__(f'gazebo_interface_{robot_name}')
         self.stage = int(stage_num)
         self.robot_name = robot_name
-
-        self.get_logger().info(f'Initializing Gazebo interface for {robot_name}, stage {stage_num}')
-
-        # Map robot names to Gazebo entity names
-        # robot1 -> burger_1, robot2 -> burger_2, robot3 -> burger_3
-        gazebo_robot_name_map = {
-            'robot1': 'burger_1',
-            'robot2': 'burger_2',
-            'robot3': 'burger_3'
-        }
-        self.gazebo_robot_name = gazebo_robot_name_map.get(robot_name, robot_name)
-        self.get_logger().info(f'Mapped {robot_name} -> Gazebo entity: {self.gazebo_robot_name}')
-
+        self.gazebo_robot_name = GAZEBO_ROBOT_MAP.get(robot_name, robot_name)
         self.entity_name = f'goal_box_{robot_name}'
         self.entity_pose_x = 0.5
         self.entity_pose_y = 0.0
 
-        # Lock for thread-safe service calls
         self._reset_lock = threading.Lock()
         self._reset_complete = threading.Event()
 
         if ROS_DISTRO == 'humble':
-            self.entity = None
-            self.open_entity()
+            self.entity = self._load_goal_entity()
             self.delete_entity_client = self.create_client(DeleteEntity, 'delete_entity')
             self.spawn_entity_client = self.create_client(SpawnEntity, 'spawn_entity')
             self.set_entity_state_client = self.create_client(SetEntityState, 'set_entity_state')
             self.reset_simulation_client = self.create_client(Empty, 'reset_simulation')
 
         self.callback_group = MutuallyExclusiveCallbackGroup()
+        self._init_services()
 
-        # Create services with robot namespace
-        self.initialize_env_service = self.create_service(
-            Goal,
-            f'/{robot_name}/initialize_env',
-            self.initialize_env_callback,
-            callback_group=self.callback_group
-        )
-        self.task_succeed_service = self.create_service(
-            Goal,
-            f'/{robot_name}/task_succeed',
-            self.task_succeed_callback,
-            callback_group=self.callback_group
-        )
-        self.task_failed_service = self.create_service(
-            Goal,
-            f'/{robot_name}/task_failed',
-            self.task_failed_callback,
-            callback_group=self.callback_group
-        )
+        self.get_logger().info(f'{robot_name} Gazebo interface initialized (stage {stage_num})')
 
-        self.get_logger().info(f'Gazebo interface for {robot_name} initialized')
+    def _load_goal_entity(self):
+        package_share = get_package_share_directory('turtlebot3_gazebo')
+        model_path = os.path.join(
+            package_share, 'models', 'turtlebot3_dqn_world', 'goal_box', 'model.sdf')
+        with open(model_path, 'r') as f:
+            return f.read()
 
-    def open_entity(self):
-        try:
-            package_share = get_package_share_directory('turtlebot3_gazebo')
-            model_path = os.path.join(
-                package_share, 'models', 'turtlebot3_dqn_world', 'goal_box', 'model.sdf'
-            )
-            with open(model_path, 'r') as f:
-                self.entity = f.read()
-            self.get_logger().info('Loaded entity from: ' + model_path)
-        except Exception as e:
-            self.get_logger().error('Failed to load entity file: {}'.format(e))
-            raise e
+    def _init_services(self):
+        self.create_service(
+            Goal, f'/{self.robot_name}/initialize_env',
+            self._initialize_env_callback, callback_group=self.callback_group)
+        self.create_service(
+            Goal, f'/{self.robot_name}/task_succeed',
+            self._task_succeed_callback, callback_group=self.callback_group)
+        self.create_service(
+            Goal, f'/{self.robot_name}/task_failed',
+            self._task_failed_callback, callback_group=self.callback_group)
 
-    def spawn_entity(self):
+    def _initialize_env_callback(self, request, response):
+        self.get_logger().info(f'{self.robot_name}: Initialize environment')
+        self._delete_entity()
+        time.sleep(0.2)
+        self._reset_robot_position()
+        time.sleep(0.2)
+        self._generate_goal_pose()
+        self.get_logger().info(
+            f'{self.robot_name}: Goal at ({self.entity_pose_x:.2f}, {self.entity_pose_y:.2f})')
+        time.sleep(0.2)
+        self._spawn_entity()
+        response.pose_x = self.entity_pose_x
+        response.pose_y = self.entity_pose_y
+        response.success = True
+        return response
+
+    def _task_succeed_callback(self, request, response):
+        self.get_logger().info(f'{self.robot_name}: Task succeeded')
+        self._delete_entity()
+        time.sleep(0.2)
+        self._generate_goal_pose()
+        self.get_logger().info(
+            f'{self.robot_name}: New goal at ({self.entity_pose_x:.2f}, {self.entity_pose_y:.2f})')
+        time.sleep(0.2)
+        self._spawn_entity()
+        response.pose_x = self.entity_pose_x
+        response.pose_y = self.entity_pose_y
+        response.success = True
+        return response
+
+    def _task_failed_callback(self, request, response):
+        self.get_logger().info(f'{self.robot_name}: Task failed')
+        self._delete_entity()
+        time.sleep(0.2)
+        self._reset_robot_position()
+        time.sleep(0.2)
+        self._generate_goal_pose()
+        self.get_logger().info(
+            f'{self.robot_name}: New goal at ({self.entity_pose_x:.2f}, {self.entity_pose_y:.2f})')
+        time.sleep(0.2)
+        self._spawn_entity()
+        response.pose_x = self.entity_pose_x
+        response.pose_y = self.entity_pose_y
+        response.success = True
+        return response
+
+    def _spawn_entity(self):
         if ROS_DISTRO == 'humble':
-            entity_pose = Pose()
-            entity_pose.position.x = self.entity_pose_x
-            entity_pose.position.y = self.entity_pose_y
-
-            spawn_req = SpawnEntity.Request()
-            spawn_req.name = self.entity_name
-            spawn_req.xml = self.entity
-            spawn_req.initial_pose = entity_pose
-
-            while not self.spawn_entity_client.wait_for_service(timeout_sec=1.0):
-                self.get_logger().warn('service for spawn_entity is not available, waiting ...')
-            future = self.spawn_entity_client.call_async(spawn_req)
-            rclpy.spin_until_future_complete(self, future)
-            self.get_logger().info(
-                f'Spawn Goal for {self.robot_name} at ({self.entity_pose_x}, {self.entity_pose_y}, {0.0})'
-            )
+            self._spawn_entity_humble()
         else:
-            service_name = '/world/dqn/create'
-            package_share = get_package_share_directory('turtlebot3_gazebo')
-            model_path = os.path.join(
-                package_share, 'models', 'turtlebot3_dqn_world', 'goal_box', 'model.sdf'
-            )
-            req = (
-                f'sdf_filename: "{model_path}", '
-                f'name: "{self.entity_name}", '
-                f'pose: {{ position: {{ '
-                f'x: {self.entity_pose_x}, '
-                f'y: {self.entity_pose_y}, '
-                f'z: 0.0 }} }}'
-            )
-            cmd = [
-                'gz', 'service',
-                '-s', service_name,
-                '--reqtype', 'gz.msgs.EntityFactory',
-                '--reptype', 'gz.msgs.Boolean',
-                '--timeout', '1000',
-                '--req', req
-            ]
-            try:
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-                self.get_logger().info(
-                    f'Spawn Goal for {self.robot_name} at ({self.entity_pose_x}, {self.entity_pose_y}, {0.0})'
-                )
-            except subprocess.CalledProcessError:
-                pass
+            self._spawn_entity_gazebo()
 
-    def delete_entity(self):
+    def _spawn_entity_humble(self):
+        entity_pose = Pose()
+        entity_pose.position.x = self.entity_pose_x
+        entity_pose.position.y = self.entity_pose_y
+
+        req = SpawnEntity.Request()
+        req.name = self.entity_name
+        req.xml = self.entity
+        req.initial_pose = entity_pose
+
+        self._wait_for_service(self.spawn_entity_client)
+        future = self.spawn_entity_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        self.get_logger().info(
+            f'{self.robot_name}: Spawned goal at '
+            f'({self.entity_pose_x:.2f}, {self.entity_pose_y:.2f})')
+
+    def _spawn_entity_gazebo(self):
+        package_share = get_package_share_directory('turtlebot3_gazebo')
+        model_path = os.path.join(
+            package_share, 'models', 'turtlebot3_dqn_world', 'goal_box', 'model.sdf')
+        req = (
+            f'sdf_filename: "{model_path}", '
+            f'name: "{self.entity_name}", '
+            f'pose: {{ position: {{ x: {self.entity_pose_x}, y: {self.entity_pose_y}, z: 0.0 }} }}'
+        )
+        self._run_gz_service('/world/dqn/create', 'gz.msgs.EntityFactory', req)
+
+    def _delete_entity(self):
         if ROS_DISTRO == 'humble':
-            delete_req = DeleteEntity.Request()
-            delete_req.name = self.entity_name
-
-            while not self.delete_entity_client.wait_for_service(timeout_sec=1.0):
-                self.get_logger().warn('service for delete_entity is not available, waiting ...')
-            future = self.delete_entity_client.call_async(delete_req)
-            rclpy.spin_until_future_complete(self, future)
-            self.get_logger().info(f'Delete Goal for {self.robot_name}')
+            self._delete_entity_humble()
         else:
-            service_name = '/world/dqn/remove'
-            req = f'name: "{self.entity_name}", type: 2'
-            cmd = [
-                'gz', 'service',
-                '-s', service_name,
-                '--reqtype', 'gz.msgs.Entity',
-                '--reptype', 'gz.msgs.Boolean',
-                '--timeout', '1000',
-                '--req', req
-            ]
-            try:
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-                self.get_logger().info(f'Delete Goal for {self.robot_name}')
-            except subprocess.CalledProcessError:
-                pass
+            self._delete_entity_gazebo()
 
-    def reset_simulation(self):
-        """Reset single robot position (for Humble) - Non-blocking version"""
-        self.get_logger().info(f'[{self.robot_name}] reset_simulation() called - Resetting ONLY this robot')
+    def _delete_entity_humble(self):
+        req = DeleteEntity.Request()
+        req.name = self.entity_name
+        self._wait_for_service(self.delete_entity_client)
+        future = self.delete_entity_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        self.get_logger().info(f'{self.robot_name}: Deleted goal')
 
-        # Reset completion event
+    def _delete_entity_gazebo(self):
+        req = f'name: "{self.entity_name}", type: 2'
+        self._run_gz_service('/world/dqn/remove', 'gz.msgs.Entity', req)
+
+    def _reset_robot_position(self):
+        if ROS_DISTRO == 'humble':
+            self._reset_robot_position_humble()
+        else:
+            self._reset_robot_position_gazebo()
+
+    def _reset_robot_position_humble(self):
         self._reset_complete.clear()
-
-        # Start reset in separate thread to avoid blocking ROS2 spin
         reset_thread = threading.Thread(target=self._reset_robot_position_sync)
         reset_thread.start()
 
-        # Wait for completion with timeout
         if not self._reset_complete.wait(timeout=5.0):
-            self.get_logger().warn(f'[{self.robot_name}] Reset timed out, continuing anyway')
+            self.get_logger().warn(f'{self.robot_name}: Reset timed out')
         else:
-            self.get_logger().info(f'[{self.robot_name}] Reset completed successfully')
+            self.get_logger().info(f'{self.robot_name}: Reset completed')
 
     def _reset_robot_position_sync(self):
-        """Synchronous robot position reset (runs in separate thread)"""
         with self._reset_lock:
             try:
-                # Get initial position for this robot based on stage
-                if self.stage == 4:
-                    # Stage 4: Use positions with more spacing
-                    initial_positions = {
-                        'robot1': {'x': 2.0, 'y': 1.0},
-                        'robot2': {'x': -2.0, 'y': 1.0},
-                        'robot3': {'x': 0.0, 'y': -2.0}
-                    }
-                else:
-                    # Stage 1, 2, 3: Use default positions
-                    initial_positions = {
-                        'robot1': {'x': 2.0, 'y': 0.0},
-                        'robot2': {'x': -0.5, 'y': 2.0},
-                        'robot3': {'x': -0.5, 'y': -2.0}
-                    }
-                pos = initial_positions.get(self.robot_name, {'x': 0.0, 'y': 0.0})
-                self.get_logger().info(f'[{self.robot_name}] Target position: ({pos["x"]}, {pos["y"]})')
+                pos = self._get_initial_position()
+                self.get_logger().info(f'{self.robot_name}: Target position: ({pos["x"]}, {pos["y"]})')
 
-                # Check service availability (non-blocking)
                 if not self.set_entity_state_client.service_is_ready():
-                    self.get_logger().warn(f'[{self.robot_name}] set_entity_state service not ready, waiting...')
-                    # Wait with timeout in thread (doesn't block main spin)
-                    ready = self.set_entity_state_client.wait_for_service(timeout_sec=3.0)
-                    if not ready:
-                        self.get_logger().error(f'[{self.robot_name}] Service not available after timeout')
+                    if not self.set_entity_state_client.wait_for_service(timeout_sec=3.0):
+                        self.get_logger().error(f'{self.robot_name}: Service not available')
                         return
 
-                # Prepare request
                 req = SetEntityState.Request()
                 state = EntityState()
                 state.name = self.gazebo_robot_name
@@ -232,168 +217,69 @@ class MultiRobotGazeboInterface(Node):
                 state.pose.position.y = pos['y']
                 state.pose.position.z = 0.01
                 state.pose.orientation.w = 1.0
-                state.twist.linear.x = 0.0
-                state.twist.linear.y = 0.0
-                state.twist.linear.z = 0.0
-                state.twist.angular.x = 0.0
-                state.twist.angular.y = 0.0
-                state.twist.angular.z = 0.0
                 req.state = state
 
-                self.get_logger().info(f'[{self.robot_name}] Calling set_entity_state for {self.gazebo_robot_name}')
-
-                # Call service asynchronously
                 future = self.set_entity_state_client.call_async(req)
 
-                # Wait for result with timeout (in this thread, not blocking main)
-                timeout_sec = 3.0
                 start_time = time.time()
                 while not future.done():
-                    if time.time() - start_time > timeout_sec:
-                        self.get_logger().warn(f'[{self.robot_name}] Service call timed out')
+                    if time.time() - start_time > 3.0:
+                        self.get_logger().warn(f'{self.robot_name}: Service call timed out')
                         break
                     time.sleep(0.05)
 
                 if future.done():
-                    try:
-                        result = future.result()
-                        self.get_logger().info(
-                            f'[{self.robot_name}] Reset {self.gazebo_robot_name} to ({pos["x"]}, {pos["y"]}) - Success: {result.success}'
-                        )
-                    except Exception as e:
-                        self.get_logger().warn(f'[{self.robot_name}] Service call exception: {e}')
-                else:
+                    result = future.result()
                     self.get_logger().info(
-                        f'[{self.robot_name}] Reset {self.gazebo_robot_name} to ({pos["x"]}, {pos["y"]}) - Async call sent'
-                    )
-
+                        f'{self.robot_name}: Reset to ({pos["x"]}, {pos["y"]}) - Success: {result.success}')
             except Exception as e:
-                self.get_logger().error(f'[{self.robot_name}] Reset failed with exception: {e}')
+                self.get_logger().error(f'{self.robot_name}: Reset failed: {e}')
             finally:
-                # Signal completion
                 self._reset_complete.set()
 
-    def reset_robot(self):
-        """Reset robot position to initial state"""
-        service_name_delete = '/world/dqn/remove'
+    def _reset_robot_position_gazebo(self):
         req_delete = f'name: "{self.gazebo_robot_name}", type: 2'
-        cmd_delete = [
-            'gz', 'service',
-            '-s', service_name_delete,
-            '--reqtype', 'gz.msgs.Entity',
-            '--reptype', 'gz.msgs.Boolean',
-            '--timeout', '1000',
-            '--req', req_delete
-        ]
-        try:
-            subprocess.run(cmd_delete, check=True, stdout=subprocess.DEVNULL)
-            self.get_logger().info(f'Delete {self.gazebo_robot_name}')
-        except subprocess.CalledProcessError:
-            pass
+        self._run_gz_service('/world/dqn/remove', 'gz.msgs.Entity', req_delete)
         time.sleep(0.2)
 
-        service_name_spawn = '/world/dqn/create'
+        pos = self._get_initial_position()
         package_share = get_package_share_directory('turtlebot3_gazebo')
         model_path = os.path.join(package_share, 'models', 'turtlebot3_burger', 'model.sdf')
-
-        # Different initial positions for each robot
-        # Match the positions from multi_robot.launch.py: [[2, 1], [-2, 1], [0, -2]]
-        initial_positions = {
-            'robot1': {'x': 2.0, 'y': 1.0},
-            'robot2': {'x': -2.0, 'y': 1.0},
-            'robot3': {'x': 0.0, 'y': -2.0}
-        }
-        pos = initial_positions.get(self.robot_name, {'x': 0.0, 'y': 0.0})
-
         req_spawn = (
             f'sdf_filename: "{model_path}", '
             f'name: "{self.gazebo_robot_name}", '
             f'pose: {{ position: {{ x: {pos["x"]}, y: {pos["y"]}, z: 0.0 }} }}'
         )
-        cmd_spawn = [
-            'gz', 'service',
-            '-s', service_name_spawn,
-            '--reqtype', 'gz.msgs.EntityFactory',
-            '--reptype', 'gz.msgs.Boolean',
-            '--timeout', '1000',
-            '--req', req_spawn
-        ]
-        try:
-            subprocess.run(cmd_spawn, check=True, stdout=subprocess.DEVNULL)
-            self.get_logger().info(f'Spawn {self.gazebo_robot_name} at ({pos["x"]}, {pos["y"]})')
-        except subprocess.CalledProcessError:
-            pass
+        self._run_gz_service('/world/dqn/create', 'gz.msgs.EntityFactory', req_spawn)
+        self.get_logger().info(f'{self.robot_name}: Respawned at ({pos["x"]}, {pos["y"]})')
 
-    def task_succeed_callback(self, request, response):
-        self.get_logger().info(f'[{self.robot_name}] Task succeed callback - Goal reached!')
-        self.delete_entity()
-        time.sleep(0.2)
-        self.generate_goal_pose()
-        self.get_logger().info(f'[{self.robot_name}] New goal generated at ({self.entity_pose_x:.2f}, {self.entity_pose_y:.2f})')
-        time.sleep(0.2)
-        self.spawn_entity()
-        response.pose_x = self.entity_pose_x
-        response.pose_y = self.entity_pose_y
-        response.success = True
-        return response
+    def _get_initial_position(self):
+        positions = INITIAL_POSITIONS['stage4'] if self.stage == 4 else INITIAL_POSITIONS['default']
+        return positions.get(self.robot_name, {'x': 0.0, 'y': 0.0})
 
-    def task_failed_callback(self, request, response):
-        self.get_logger().info(f'[{self.robot_name}] Task failed callback - Collision/Timeout detected!')
-        self.delete_entity()
-        time.sleep(0.2)
-        if ROS_DISTRO == 'humble':
-            self.get_logger().info(f'[{self.robot_name}] Resetting robot position (Humble mode)')
-            self.reset_simulation()
-        else:
-            self.get_logger().info(f'[{self.robot_name}] Resetting robot position (Gazebo mode)')
-            self.reset_robot()
-        time.sleep(0.2)
-        self.generate_goal_pose()
-        self.get_logger().info(f'[{self.robot_name}] New goal generated at ({self.entity_pose_x:.2f}, {self.entity_pose_y:.2f})')
-        time.sleep(0.2)
-        self.spawn_entity()
-        response.pose_x = self.entity_pose_x
-        response.pose_y = self.entity_pose_y
-        response.success = True
-        self.get_logger().info(f'[{self.robot_name}] Task failed callback complete')
-        return response
-
-    def initialize_env_callback(self, request, response):
-        self.get_logger().info(f'[{self.robot_name}] Initialize environment callback')
-        self.delete_entity()
-        time.sleep(0.2)
-        if ROS_DISTRO == 'humble':
-            self.get_logger().info(f'[{self.robot_name}] Resetting robot position (Humble mode)')
-            self.reset_simulation()
-        else:
-            self.get_logger().info(f'[{self.robot_name}] Resetting robot position (Gazebo mode)')
-            self.reset_robot()
-        time.sleep(0.2)
-        self.generate_goal_pose()
-        self.get_logger().info(f'[{self.robot_name}] Initial goal generated at ({self.entity_pose_x:.2f}, {self.entity_pose_y:.2f})')
-        time.sleep(0.2)
-        self.spawn_entity()
-        response.pose_x = self.entity_pose_x
-        response.pose_y = self.entity_pose_y
-        response.success = True
-        self.get_logger().info(f'[{self.robot_name}] Initialize environment callback complete')
-        return response
-
-    def generate_goal_pose(self):
-        """Generate goal position avoiding other robots' goals"""
+    def _generate_goal_pose(self):
         if self.stage != 4:
-            # Random position in the environment
             self.entity_pose_x = random.randrange(-21, 21) / 10
             self.entity_pose_y = random.randrange(-21, 21) / 10
         else:
-            # Predefined positions for stage 4
-            goal_pose_list = [
-                [1.0, 0.0], [2.0, -1.5], [0.0, -2.0], [2.0, 1.5], [0.5, 2.0], [-1.5, 2.1],
-                [-2.0, 0.5], [-2.0, -0.5], [-1.5, -2.0], [-0.5, -1.0], [2.0, -0.5], [-1.0, -1.0]
-            ]
-            rand_index = random.randint(0, len(goal_pose_list) - 1)
-            self.entity_pose_x = goal_pose_list[rand_index][0]
-            self.entity_pose_y = goal_pose_list[rand_index][1]
+            goal = random.choice(STAGE4_GOAL_POSITIONS)
+            self.entity_pose_x = goal[0]
+            self.entity_pose_y = goal[1]
+
+    def _wait_for_service(self, client):
+        while not client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn(f'Waiting for {client.srv_name} service...')
+
+    def _run_gz_service(self, service_name, req_type, req):
+        cmd = [
+            'gz', 'service', '-s', service_name,
+            '--reqtype', req_type, '--reptype', 'gz.msgs.Boolean',
+            '--timeout', '1000', '--req', req,
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            pass
 
 
 def main(args=None):
@@ -404,16 +290,16 @@ def main(args=None):
     if len(sys.argv) < 3:
         print(f'WARNING: robot_name not specified, defaulting to "{robot_name}"')
         print(f'Usage: ros2 run turtlebot3_dqn multi_robot_gazebo <stage_num> <robot_name>')
-        print(f'Example: ros2 run turtlebot3_dqn multi_robot_gazebo 1 robot2')
 
-    gazebo_interface = MultiRobotGazeboInterface(stage_num, robot_name)
+    node = MultiRobotGazeboInterface(stage_num, robot_name)
+
     try:
         while rclpy.ok():
-            rclpy.spin_once(gazebo_interface, timeout_sec=0.1)
+            rclpy.spin_once(node, timeout_sec=0.1)
     except KeyboardInterrupt:
         pass
     finally:
-        gazebo_interface.destroy_node()
+        node.destroy_node()
         rclpy.shutdown()
 
 
