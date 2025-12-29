@@ -178,13 +178,27 @@ class DQNAgent(Node):
         time.sleep(1.0)
 
         last_processed_episode = 0
+        episode_wait_timeout = 60.0
 
         while rclpy.ok():
+            wait_start = time.time()
+            timed_out = False
             while self.current_episode <= last_processed_episode and rclpy.ok():
+                if time.time() - wait_start > episode_wait_timeout:
+                    self.get_logger().error(
+                        f'{self.robot_name}: Timeout waiting for episode start signal '
+                        f'(last={last_processed_episode}, current={self.current_episode}). Forcing next episode.')
+                    timed_out = True
+                    break
                 time.sleep(0.1)
 
             if not rclpy.ok():
                 break
+
+            if timed_out:
+                last_processed_episode += 1
+                self.current_episode = last_processed_episode
+                self.get_logger().warn(f'{self.robot_name}: Forced episode to {last_processed_episode}')
 
             episode = self.current_episode
             last_processed_episode = episode
