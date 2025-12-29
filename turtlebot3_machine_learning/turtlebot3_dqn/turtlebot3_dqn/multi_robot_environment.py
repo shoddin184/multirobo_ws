@@ -14,6 +14,7 @@ from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty
+from std_msgs.msg import Bool
 from turtlebot3_msgs.srv import Dqn, Goal
 
 ROS_DISTRO = os.environ.get('ROS_DISTRO')
@@ -69,6 +70,8 @@ class MultiRobotRLEnvironment(Node):
 
         self.cmd_vel_pub = self.create_publisher(
             cmd_vel_type, f'/{self.gazebo_ns}/cmd_vel', qos)
+        self.succeed_pub = self.create_publisher(
+            Bool, f'/{self.robot_name}/episode_succeed', qos)
         self.create_subscription(
             Odometry, f'/{self.gazebo_ns}/odom', self._odom_callback, qos)
         self.create_subscription(
@@ -264,6 +267,10 @@ class MultiRobotRLEnvironment(Node):
         self.done = True
         self.local_step = 0
         self._stop_robot()
+
+        succeed_msg = Bool()
+        succeed_msg.data = succeed
+        self.succeed_pub.publish(succeed_msg)
 
     def _reset_episode_flags(self):
         self.done = False

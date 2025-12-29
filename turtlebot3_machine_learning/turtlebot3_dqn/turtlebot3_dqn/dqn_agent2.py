@@ -14,7 +14,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from std_msgs.msg import Float32MultiArray, String, Int32
+from std_msgs.msg import Float32MultiArray, String, Int32, Bool
 import tensorflow
 from tensorflow.keras.layers import Dense, Input
 from tensorflow.keras.losses import MeanSquaredError
@@ -141,6 +141,13 @@ class DQNAgent(Node):
         self.create_subscription(
             Int32, '/start_episode', self._start_episode_callback, 10,
             callback_group=self.cb_group)
+        self.create_subscription(
+            Bool, f'/{self.robot_name}/episode_succeed', self._succeed_callback, 10,
+            callback_group=self.cb_group)
+        self.episode_succeed = False
+
+    def _succeed_callback(self, msg):
+        self.episode_succeed = msg.data
 
     def _init_service_clients(self):
         self.rl_agent_interface_client = self.create_client(
@@ -178,27 +185,20 @@ class DQNAgent(Node):
         time.sleep(1.0)
 
         last_processed_episode = 0
-        episode_wait_timeout = 60.0
+        episode_wait_timeout = 300.0
 
         while rclpy.ok():
             wait_start = time.time()
-            timed_out = False
             while self.current_episode <= last_processed_episode and rclpy.ok():
                 if time.time() - wait_start > episode_wait_timeout:
-                    self.get_logger().error(
-                        f'{self.robot_name}: Timeout waiting for episode start signal '
-                        f'(last={last_processed_episode}, current={self.current_episode}). Forcing next episode.')
-                    timed_out = True
-                    break
+                    self.get_logger().warn(
+                        f'{self.robot_name}: Still waiting for episode start signal '
+                        f'(last={last_processed_episode}, current={self.current_episode})')
+                    wait_start = time.time()
                 time.sleep(0.1)
 
             if not rclpy.ok():
                 break
-
-            if timed_out:
-                last_processed_episode += 1
-                self.current_episode = last_processed_episode
-                self.get_logger().warn(f'{self.robot_name}: Forced episode to {last_processed_episode}')
 
             episode = self.current_episode
             last_processed_episode = episode
@@ -236,8 +236,9 @@ class DQNAgent(Node):
                     avg_max_q = sum_max_q / local_step if local_step > 0 else 0.0
 
                     msg = Float32MultiArray()
-                    msg.data = [float(score), float(avg_max_q)]
+                    msg.data = [float(score), float(avg_max_q), float(self.episode_succeed)]
                     self.result_pub.publish(msg)
+                    self.episode_succeed = False
 
                     if LOGGING:
                         self.dqn_reward_metric.update_state(score)

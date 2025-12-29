@@ -55,11 +55,12 @@ class ResultCSVLogger(Node):
 
         self.episode_count = 0
         self.current_episode_data = {
-            rn: {'score': None, 'q_value': None, 'received': False}
+            rn: {'score': None, 'q_value': None, 'success': None, 'received': False}
             for rn in ROBOT_NAMES
         }
         self.episode_rewards = []
         self.episode_q_values = []
+        self.episode_team_successes = []
 
         for robot_name in ROBOT_NAMES:
             self.create_subscription(
@@ -83,11 +84,13 @@ class ResultCSVLogger(Node):
             writer.writerow([])
             writer.writerow([
                 'episode', 'avg_team_reward', 'avg_team_q_value',
-                'min_reward', 'max_reward', 'min_q_value', 'max_q_value'])
+                'min_reward', 'max_reward', 'min_q_value', 'max_q_value',
+                'avg_team_success_rate'])
 
     def _data_callback(self, msg, robot_name):
         self.current_episode_data[robot_name]['score'] = msg.data[0]
         self.current_episode_data[robot_name]['q_value'] = msg.data[1]
+        self.current_episode_data[robot_name]['success'] = msg.data[2]
         self.current_episode_data[robot_name]['received'] = True
 
         if not all(self.current_episode_data[rn]['received'] for rn in ROBOT_NAMES):
@@ -95,24 +98,30 @@ class ResultCSVLogger(Node):
 
         total_reward = sum(self.current_episode_data[rn]['score'] for rn in ROBOT_NAMES)
         total_q_value = sum(self.current_episode_data[rn]['q_value'] for rn in ROBOT_NAMES)
+        team_success_count = sum(
+            1 for rn in ROBOT_NAMES if self.current_episode_data[rn]['success'] > 0.5
+        )
 
         self.episode_count += 1
         self.episode_rewards.append(total_reward)
         self.episode_q_values.append(total_q_value)
+        self.episode_team_successes.append(team_success_count)
 
         if self.episode_count % SAVE_INTERVAL == 0:
             self._save_interval_data()
 
         for rn in ROBOT_NAMES:
-            self.current_episode_data[rn] = {'score': None, 'q_value': None, 'received': False}
+            self.current_episode_data[rn] = {'score': None, 'q_value': None, 'success': None, 'received': False}
 
     def _save_interval_data(self):
         start_idx = self.episode_count - SAVE_INTERVAL
         rewards = self.episode_rewards[start_idx:self.episode_count]
         q_values = self.episode_q_values[start_idx:self.episode_count]
+        team_successes = self.episode_team_successes[start_idx:self.episode_count]
 
         avg_reward = sum(rewards) / len(rewards)
         avg_q_value = sum(q_values) / len(q_values)
+        avg_team_success_rate = sum(team_successes) / len(team_successes) / len(ROBOT_NAMES)
 
         with open(self.csv_path, 'a', newline='') as f:
             writer = csv.writer(f)
@@ -120,10 +129,11 @@ class ResultCSVLogger(Node):
                 self.episode_count,
                 f'{avg_reward:.4f}', f'{avg_q_value:.4f}',
                 f'{min(rewards):.4f}', f'{max(rewards):.4f}',
-                f'{min(q_values):.4f}', f'{max(q_values):.4f}'])
+                f'{min(q_values):.4f}', f'{max(q_values):.4f}',
+                f'{avg_team_success_rate:.4f}'])
 
         self.get_logger().info(
-            f'Episode {self.episode_count}: Avg Reward={avg_reward:.2f}, Avg Q={avg_q_value:.4f}')
+            f'Episode {self.episode_count}: Avg Reward={avg_reward:.2f}, Avg Q={avg_q_value:.4f}, Team Success Rate={avg_team_success_rate:.2%}')
 
     def destroy_node(self):
         remaining = self.episode_count % SAVE_INTERVAL
@@ -131,10 +141,12 @@ class ResultCSVLogger(Node):
             start_idx = self.episode_count - remaining
             rewards = self.episode_rewards[start_idx:]
             q_values = self.episode_q_values[start_idx:]
+            team_successes = self.episode_team_successes[start_idx:]
 
             if rewards:
                 avg_reward = sum(rewards) / len(rewards)
                 avg_q_value = sum(q_values) / len(q_values)
+                avg_team_success_rate = sum(team_successes) / len(team_successes) / len(ROBOT_NAMES)
 
                 with open(self.csv_path, 'a', newline='') as f:
                     writer = csv.writer(f)
@@ -142,7 +154,8 @@ class ResultCSVLogger(Node):
                         f'{self.episode_count} (partial: {remaining} episodes)',
                         f'{avg_reward:.4f}', f'{avg_q_value:.4f}',
                         f'{min(rewards):.4f}', f'{max(rewards):.4f}',
-                        f'{min(q_values):.4f}', f'{max(q_values):.4f}'])
+                        f'{min(q_values):.4f}', f'{max(q_values):.4f}',
+                        f'{avg_team_success_rate:.4f}'])
 
                 self.get_logger().info(f'Saved partial data ({remaining} episodes)')
 

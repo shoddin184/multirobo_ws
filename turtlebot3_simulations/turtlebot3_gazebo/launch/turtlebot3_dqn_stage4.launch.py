@@ -35,7 +35,7 @@ def generate_launch_description():
 
     number_of_robots = 3
     namespace = 'TB3'
-    pose = [[2, 1], [-2, 1], [0, -2]]
+    pose = [[1, 0], [-0.5, 1], [-0.5, -1]]
     model_folder = 'turtlebot3_' + TURTLEBOT3_MODEL
     urdf_path = os.path.join(
         get_package_share_directory('turtlebot3_gazebo'),
