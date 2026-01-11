@@ -24,14 +24,14 @@ GAZEBO_ROBOT_MAP = {'robot1': 'burger_1', 'robot2': 'burger_2', 'robot3': 'burge
 
 INITIAL_POSITIONS = {
     'default': {
-        'robot1': {'x': 2.0, 'y': 0.0},
-        'robot2': {'x': -0.5, 'y': 2.0},
-        'robot3': {'x': -0.5, 'y': -2.0},
+        'robot1': {'x': 1.0, 'y': 0.0},
+        'robot2': {'x': -0.5, 'y': 1.0},
+        'robot3': {'x': -0.5, 'y': -1.0},
     },
     'stage4': {
-        'robot1': {'x': 2.0, 'y': 1.0},
-        'robot2': {'x': -2.0, 'y': 1.0},
-        'robot3': {'x': 0.0, 'y': -2.0},
+        'robot1': {'x': 1.0, 'y': 1.0},
+        'robot2': {'x': -1.0, 'y': 1.0},
+        'robot3': {'x': 0.0, 'y': -1.0},
     },
 }
 
