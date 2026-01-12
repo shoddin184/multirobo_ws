@@ -214,6 +214,12 @@ class DQNAgent(Node):
             while True:
                 local_step += 1
 
+                # デバッグ: 30ステップごとに状況を出力
+                if local_step % 30 == 0:
+                    self.get_logger().info(
+                        f'[DEBUG-STEP] {self.robot_name}: ep={episode}, step={local_step}, '
+                        f'mem={len(self.replay_memory)}, eps={self.epsilon:.3f}, score={score:.1f}')
+
                 q_values = self.model.predict(state, verbose=0)
                 sum_max_q += float(numpy.max(q_values))
 
@@ -258,12 +264,20 @@ class DQNAgent(Node):
                 self._save_model(episode)
 
     def _get_current_state(self):
+        wait_count = 0
         while not self.get_state_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info(f'{self.robot_name}: Waiting for get_state service...')
+            wait_count += 1
+            self.get_logger().info(f'{self.robot_name}: Waiting for get_state service... ({wait_count})')
 
         future = self.get_state_client.call_async(Dqn.Request())
+        wait_start = time.time()
         while not future.done() and rclpy.ok():
             time.sleep(0.01)
+            # デバッグ: 3秒以上待っていたら報告
+            elapsed = time.time() - wait_start
+            if elapsed > 3.0 and int(elapsed) % 3 == 0:
+                self.get_logger().warn(
+                    f'[DEBUG-WAIT] {self.robot_name}: get_state待機中 {elapsed:.1f}秒経過')
 
         if future.result() is not None:
             state = future.result().state
@@ -285,12 +299,20 @@ class DQNAgent(Node):
         req = Dqn.Request()
         req.action = action
 
+        wait_count = 0
         while not self.rl_agent_interface_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info(f'{self.robot_name}: Waiting for rl_agent_interface...')
+            wait_count += 1
+            self.get_logger().info(f'{self.robot_name}: Waiting for rl_agent_interface... ({wait_count})')
 
         future = self.rl_agent_interface_client.call_async(req)
+        wait_start = time.time()
         while not future.done() and rclpy.ok():
             time.sleep(0.01)
+            # デバッグ: 3秒以上待っていたら報告
+            elapsed = time.time() - wait_start
+            if elapsed > 3.0 and int(elapsed) % 3 == 0:
+                self.get_logger().warn(
+                    f'[DEBUG-WAIT] {self.robot_name}: rl_agent_interface待機中 {elapsed:.1f}秒経過, action={action}')
 
         if future.result() is not None:
             result = future.result()
