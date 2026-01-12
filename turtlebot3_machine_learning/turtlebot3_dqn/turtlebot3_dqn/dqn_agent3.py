@@ -100,11 +100,16 @@ class DQNAgent(Node):
         self.current_episode = 0
         self.callback_count = 0
 
+        # Debug tracking
+        self.debug_phase = 'initializing'
+        self.debug_local_step = 0
+        self.debug_last_activity = time.time()
+
         self.process_thread = threading.Thread(target=self._process_wrapper)
         self.process_thread.daemon = True
         self.process_thread.start()
 
-        self.debug_timer = self.create_timer(5.0, self._debug_status_callback)
+        self.debug_timer = self.create_timer(30.0, self._debug_status_callback)
         self.get_logger().info(f'{robot_name} DQN Agent initialized')
 
     def _load_saved_model(self):
@@ -149,9 +154,11 @@ class DQNAgent(Node):
             Dqn, f'/{self.robot_name}/get_state', callback_group=self.cb_group)
 
     def _debug_status_callback(self):
-        self.get_logger().info(
-            f'[DEBUG] {self.robot_name}: episode_requested={self.episode_start_requested}, '
-            f'episode={self.current_episode}, callbacks={self.callback_count}')
+        elapsed = time.time() - self.debug_last_activity
+        self.get_logger().warn(
+            f'[DEBUG] {self.robot_name}: phase={self.debug_phase}, '
+            f'episode={self.current_episode}, step={self.debug_local_step}, '
+            f'idle={elapsed:.1f}s, mem={len(self.replay_memory)}, eps={self.epsilon:.3f}')
 
     def _process_wrapper(self):
         try:
@@ -175,12 +182,16 @@ class DQNAgent(Node):
 
     def _process(self):
         self.get_logger().info(f'{self.robot_name}: Process started, waiting for coordinator...')
+        self.debug_phase = 'waiting_coordinator'
+        self.debug_last_activity = time.time()
         time.sleep(1.0)
 
         last_processed_episode = 0
         episode_wait_timeout = 60.0
 
         while rclpy.ok():
+            self.debug_phase = 'waiting_episode_signal'
+            self.debug_last_activity = time.time()
             wait_start = time.time()
             timed_out = False
             while self.current_episode <= last_processed_episode and rclpy.ok():
@@ -206,6 +217,8 @@ class DQNAgent(Node):
 
             self.get_logger().info(f'{self.robot_name}: Starting episode {episode}')
 
+            self.debug_phase = 'get_initial_state'
+            self.debug_last_activity = time.time()
             state = self._get_current_state()
             local_step = 0
             score = 0
@@ -213,11 +226,15 @@ class DQNAgent(Node):
 
             while True:
                 local_step += 1
+                self.debug_local_step = local_step
+                self.debug_last_activity = time.time()
 
+                self.debug_phase = 'predict'
                 q_values = self.model.predict(state, verbose=0)
                 sum_max_q += float(numpy.max(q_values))
 
                 action = int(self._get_action(state))
+                self.debug_phase = f'step_action_{action}'
                 next_state, reward, done = self._step(action)
                 score += reward
 
@@ -226,6 +243,7 @@ class DQNAgent(Node):
                 self.action_pub.publish(msg)
 
                 if self.train_mode:
+                    self.debug_phase = 'training'
                     self.replay_memory.append((state, action, reward, next_state, done))
                     self._train_model(done)
 
