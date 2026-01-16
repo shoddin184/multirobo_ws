@@ -1,0 +1,8 @@
+# Markdown files
+*.md
+
+# Python cache
+__pycache__/
+
+# Saved models
+saved_model/
